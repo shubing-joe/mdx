@@ -1,0 +1,14 @@
+erDiagram
+    DOC ||--o{ BLOCK : contains
+    BLOCK ||--o{ ASSET : references
+    DOC {
+        string path
+        string title
+    }
+    BLOCK {
+        string kind
+    }
+    ASSET {
+        string sha256
+        string mime
+    }

@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    name: fmt, clippy, tests, release build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install system libraries
+        # `mdx-gui` links against the windowing and OpenGL loader libraries the
+        # workspace builds with; the tests themselves run headless.
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            libegl1-mesa-dev \
+            libgl1-mesa-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxkbcommon-dev
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache the build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Audit dependency licenses
+        run: scripts/license-audit.sh
+
+      - name: Build the release binary
+        run: cargo build --release --workspace
+
+      - name: Upload the mdx binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: mdx-${{ runner.os }}-${{ runner.arch }}
+          path: target/release/mdx
+          if-no-files-found: error
+          retention-days: 14

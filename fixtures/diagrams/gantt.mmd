@@ -1,0 +1,9 @@
+gantt
+    title Milestone M1
+    dateFormat YYYY-MM-DD
+    section Parse
+    Comrak bridge :done, p1, 2026-01-05, 3d
+    Frontmatter   :active, p2, after p1, 2d
+    section Render
+    Typst world :p3, after p2, 5d
+    PDF output  :p4, after p3, 2d

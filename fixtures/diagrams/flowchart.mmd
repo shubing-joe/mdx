@@ -1,0 +1,7 @@
+flowchart TD
+    A[Read markdown] --> B{Fenced mermaid?}
+    B -->|yes| C[Render diagram]
+    B -->|no| D[Plain block]
+    C --> E([Inline SVG])
+    D --> E
+    E --> F[Write Typst]

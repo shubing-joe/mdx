@@ -1,0 +1,11 @@
+sequenceDiagram
+    participant U as User
+    participant C as mdx-cli
+    participant T as Typst
+    participant D as Diagram
+    U->>C: mdx render doc.md
+    C->>D: render mermaid
+    D-->>C: inline SVG
+    C->>T: write markup
+    T-->>C: PDF bytes
+    C-->>U: doc.pdf

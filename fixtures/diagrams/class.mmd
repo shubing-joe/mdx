@@ -1,0 +1,13 @@
+classDiagram
+    class Doc {
+        +String path
+        +Vec blocks
+    }
+    class Block {
+        +String kind
+    }
+    class DiagramBlock {
+        +String source
+    }
+    Doc "1" --> "*" Block : contains
+    Block <|-- DiagramBlock

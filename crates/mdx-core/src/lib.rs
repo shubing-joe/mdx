@@ -10,7 +10,5 @@ pub mod doc;
 pub mod exit;
 
 pub use diag::{DiagCode, Diagnostic, Report, Severity};
-pub use doc::{
-    Align, AssetId, AssetKind, Block, Doc, FrontMatter, Inline, TocEntry,
-};
+pub use doc::{Align, AssetId, AssetKind, Block, Doc, FrontMatter, Inline, TocEntry};
 pub use exit::exit_code;

@@ -9,4 +9,12 @@ license.workspace = true
 mdx-core = { workspace = true }
 tylax = { workspace = true }
 ratex-svg = { workspace = true }
+# `svg.rs` needs the RaTeX front end, not just the SVG serializer: `ratex-svg`
+# only turns a `DisplayList` into SVG, so LaTeX parsing (`ratex-parser`) and
+# layout (`ratex-layout`) come in directly. Declared with an explicit version
+# rather than `workspace = true` so this crate owns its slice of the manifest;
+# promote them to `[workspace.dependencies]` in the workspace manifest if the
+# integrator prefers uniform version pinning.
+ratex-parser = "0.1.15"
+ratex-layout = "0.1.15"
 thiserror = { workspace = true }

@@ -11,6 +11,7 @@ mdx-assets = { workspace = true }
 typst = { workspace = true }
 typst-pdf = { workspace = true }
 typst-svg = { workspace = true }
+typst-layout = { workspace = true }
 typst-assets = { workspace = true }
 comemo = { workspace = true }
 thiserror = { workspace = true }

@@ -23,7 +23,11 @@ pub fn exit_code(report: &Report) -> i32 {
         DiagCode::AssetUnsupported,
         DiagCode::AssetOffline,
     ];
-    if report.diagnostics.iter().any(|d| asset_codes.contains(&d.code)) {
+    if report
+        .diagnostics
+        .iter()
+        .any(|d| asset_codes.contains(&d.code))
+    {
         ASSETS
     } else {
         FAILED

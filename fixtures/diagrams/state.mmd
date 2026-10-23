@@ -1,0 +1,8 @@
+stateDiagram-v2
+    [*] --> Parsing
+    Parsing --> Resolving
+    Resolving --> Rendering
+    Rendering --> Writing
+    Rendering --> Failed : render error
+    Failed --> Rendering : retry
+    Writing --> [*]

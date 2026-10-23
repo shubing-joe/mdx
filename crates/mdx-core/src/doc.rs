@@ -64,7 +64,12 @@ pub struct Doc {
 impl Doc {
     pub fn new(blocks: Vec<Block>) -> Self {
         let toc = collect_toc(&blocks);
-        Self { source_path: None, front: FrontMatter::default(), blocks, toc }
+        Self {
+            source_path: None,
+            front: FrontMatter::default(),
+            blocks,
+            toc,
+        }
     }
 }
 
