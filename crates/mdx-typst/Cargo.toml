@@ -1,0 +1,17 @@
+[package]
+name = "mdx-typst"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mdx-core = { workspace = true }
+mdx-assets = { workspace = true }
+typst = { workspace = true }
+typst-pdf = { workspace = true }
+typst-svg = { workspace = true }
+typst-assets = { workspace = true }
+comemo = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }

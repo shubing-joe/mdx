@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/shubing-joe/mdx"
+
+[workspace.dependencies]
+mdx-core = { path = "crates/mdx-core" }
+mdx-parse = { path = "crates/mdx-parse" }
+mdx-assets = { path = "crates/mdx-assets" }
+mdx-math = { path = "crates/mdx-math" }
+mdx-diagram = { path = "crates/mdx-diagram" }
+mdx-typst = { path = "crates/mdx-typst" }
+mdx-html = { path = "crates/mdx-html" }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9.34"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+sha2 = "0.11"
+base64 = "0.23"
+mime_guess = "2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
+comrak = { version = "0.57", default-features = false }
+tylax = "0.3.8"
+ratex-svg = "0.1.15"
+merman = { version = "0.9.2", default-features = false, features = ["all-diagrams", "complete-svg"] }
+typst = "0.15.1"
+typst-pdf = "0.15.1"
+typst-svg = "0.15.1"
+typst-assets = { version = "0.15.1", features = ["fonts"] }
+comemo = "0.5"
+syntect = { version = "5.3", default-features = false, features = ["default-fancy", "default-syntaxes", "default-themes", "html"] }
+rmcp = { version = "3.7", features = ["server", "transport-io", "macros"] }
+egui = "0.37"
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui_extras = { version = "0.37", features = ["svg", "image"] }
+tempfile = "3"
+walkdir = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

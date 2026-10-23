@@ -1,0 +1,12 @@
+[package]
+name = "mdx-math"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mdx-core = { workspace = true }
+tylax = { workspace = true }
+ratex-svg = { workspace = true }
+thiserror = { workspace = true }

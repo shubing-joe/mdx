@@ -1,0 +1,23 @@
+[package]
+name = "mdx-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mdx"
+path = "src/main.rs"
+
+[dependencies]
+mdx-core = { workspace = true }
+mdx-parse = { workspace = true }
+mdx-assets = { workspace = true }
+mdx-math = { workspace = true }
+mdx-diagram = { workspace = true }
+mdx-typst = { workspace = true }
+mdx-html = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

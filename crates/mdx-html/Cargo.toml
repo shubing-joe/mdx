@@ -1,0 +1,13 @@
+[package]
+name = "mdx-html"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mdx-core = { workspace = true }
+mdx-assets = { workspace = true }
+base64 = { workspace = true }
+mime_guess = { workspace = true }
+thiserror = { workspace = true }

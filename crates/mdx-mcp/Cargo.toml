@@ -1,0 +1,25 @@
+[package]
+name = "mdx-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mdx-mcp"
+path = "src/main.rs"
+
+[dependencies]
+mdx-core = { workspace = true }
+mdx-parse = { workspace = true }
+mdx-assets = { workspace = true }
+mdx-math = { workspace = true }
+mdx-diagram = { workspace = true }
+mdx-typst = { workspace = true }
+mdx-html = { workspace = true }
+rmcp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
+schemars = "1"
+thiserror = { workspace = true }

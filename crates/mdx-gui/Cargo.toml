@@ -1,0 +1,22 @@
+[package]
+name = "mdx-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mdx-gui"
+path = "src/main.rs"
+
+[dependencies]
+mdx-core = { workspace = true }
+mdx-parse = { workspace = true }
+mdx-assets = { workspace = true }
+mdx-math = { workspace = true }
+mdx-diagram = { workspace = true }
+mdx-typst = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+egui_extras = { workspace = true }
+serde_json = { workspace = true }
