@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=mdx
+GenericName=Markdown editor
+Comment=Write Markdown and preview the rendered pages
+Comment[en_GB]=Write Markdown and preview the rendered pages
+Exec=mdx-gui %f
+Icon=mdx
+Terminal=false
+Categories=Office;TextEditor;
+Keywords=markdown;pdf;html;math;mermaid;
+MimeType=text/markdown;
+StartupNotify=true
+StartupWMClass=mdx

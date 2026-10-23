@@ -1,0 +1,7 @@
+# The benchmark crate is excluded from the workspace (see /Cargo.toml), so
+# cargo resolves it against the library crates by path and writes its own lock
+# file and build directory here. Neither is a product artifact: the lock file
+# only pins the path dependencies this crate re-exports, and the workspace lock
+# at /Cargo.lock remains the authority for everything the product builds.
+Cargo.lock
+target/

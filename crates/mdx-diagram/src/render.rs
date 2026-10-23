@@ -38,7 +38,8 @@
 //! a diagnostic code without parsing prose. The prefixes are the diagram codes of
 //! `mdx_core::DiagCode`:
 //!
-//! * `E_DIAGRAM_PARSE: …` — empty, malformed, or unsupported diagram source.
+//! * `E_DIAGRAM_PARSE: …` — empty, malformed, or unsupported diagram source;
+//!   the prefix names the diagram type keyword and the source's first line;
 //! * `E_DIAGRAM_RENDER: …` — the diagram was understood, but rendering could not
 //!   use the requested font files or produced output that violates the SVG
 //!   contract above.
@@ -60,6 +61,38 @@ const PARSE_CODE: &str = "E_DIAGRAM_PARSE";
 /// Error prefix for failures that are not the source's fault: an unusable font
 /// file, or output that violates the SVG contract.
 const RENDER_CODE: &str = "E_DIAGRAM_RENDER";
+
+/// Longest source excerpt placed in a parse diagnostic prefix, in characters.
+const CONTEXT_LIMIT: usize = 60;
+
+/// Canonical diagram keywords, one per fixture of `fixtures/diagrams`; see
+/// [`supported_types`].
+const SUPPORTED_TYPES: &[&str] = &[
+    "flowchart",
+    "sequenceDiagram",
+    "classDiagram",
+    "stateDiagram-v2",
+    "gantt",
+    "pie",
+    "mindmap",
+    "erDiagram",
+    "journey",
+    "gitGraph",
+    "timeline",
+    "quadrantChart",
+];
+
+/// The Mermaid diagram types this crate renders, spelled as the corpus keywords
+/// that introduce them (`fixtures/diagrams/*.mmd`).
+///
+/// The list is the canonical spelling of each kind: Mermaid's alternative
+/// openings are folded onto it, so `graph` names the same type as `flowchart`
+/// and `stateDiagram` the same as `stateDiagram-v2`. Every entry is a type
+/// [`render_svg`] accepts; a source that opens with any other keyword fails with
+/// `E_DIAGRAM_PARSE`.
+pub fn supported_types() -> &'static [&'static str] {
+    SUPPORTED_TYPES
+}
 
 /// Measurement profile name for the font-file metric source.
 const FONT_PROFILE: &str = "mdx-diagram.font-file-advances";
@@ -111,10 +144,20 @@ impl Default for DiagramOptions {
 /// `<foreignObject>` HTML label, and is stable: the same source and options
 /// always produce the same bytes, element ids included.
 ///
+/// With no explicit [`DiagramOptions::font_files`] the result is also stored in
+/// the on-disk cache of [`crate::cache`] and a stored result is returned without
+/// rendering again. The cache is advisory in both directions: a miss, an
+/// unusable cache directory, or an entry that no longer satisfies the output
+/// contract all fall back to a fresh render, and a render never fails because of
+/// it.
+///
 /// # Errors
 ///
 /// * `E_DIAGRAM_PARSE: …` when the source is empty, is not a Mermaid diagram, or
-///   uses a diagram type this build cannot render.
+///   uses a diagram type this build cannot render. Every other parse failure
+///   carries the diagram type keyword and the source's first line — at most 60
+///   characters, separated by `: ` — so the offending block is identifiable, as
+///   in ``flowchart: `flowchart TD`: …``.
 /// * `E_DIAGRAM_RENDER: …` when a file in [`DiagramOptions::font_files`] cannot
 ///   be read or is not an sfnt font, or when the renderer returned output that
 ///   violates the SVG contract above.
@@ -133,30 +176,141 @@ pub fn render_svg(src: &str, opts: &DiagramOptions) -> Result<String, String> {
         return Err(error(PARSE_CODE, "empty Mermaid source"));
     }
 
+    // The on-disk cache is only consulted for the deterministic metric source:
+    // with explicit font files the geometry depends on those files, which the
+    // cache key does not include, so an entry shared with another font set could
+    // hand back the wrong bytes. A hit still has to satisfy the same output
+    // contract, and every cache failure simply falls through to a fresh render.
+    let disk_cache = opts.font_files.is_empty();
+    if disk_cache
+        && let Some(cached) = cache::load(source)
+        && validate_output(&cached).is_ok()
+    {
+        return Ok(cached);
+    }
+
     let environment = build_environment(opts)?;
     let request = svg_request(environment, source);
     let output = Renderer::new()
         .render(RenderRequest::svg(source, OperationControl::new(), request))
-        .map_err(|failure| error(PARSE_CODE, &failure.to_string()))?;
+        .map_err(|failure| parse_error(source, &failure.to_string()))?;
 
     let RenderOutput::Svg(rendered) = output else {
-        return Err(error(
-            PARSE_CODE,
+        return Err(parse_error(
+            source,
             "renderer did not return SVG output for an SVG request",
         ));
     };
     let Some(rendered) = rendered else {
-        return Err(error(PARSE_CODE, "no Mermaid diagram detected in source"));
+        return Err(parse_error(source, "no Mermaid diagram detected in source"));
     };
 
     let svg = rendered.into_parts().0;
     validate_output(&svg)?;
+    if disk_cache {
+        // Best effort: the cache is advisory, so a read-only cache directory or a
+        // full disk degrades to rendering-only instead of failing the render.
+        let _ = cache::store(source, &svg);
+    }
     Ok(svg)
 }
 
 /// Formats a failure with its stable code prefix.
 fn error(code: &str, message: &str) -> String {
     format!("{code}: {message}")
+}
+
+/// Formats a parse failure, naming the block that failed.
+///
+/// The cause keeps its wording; the type keyword and first line of `source` are
+/// prefixed to it, so one line of a report identifies which diagram broke while
+/// the stable `E_DIAGRAM_PARSE` prefix stays first for callers that map the code.
+fn parse_error(source: &str, cause: &str) -> String {
+    error(PARSE_CODE, &format!("{}: {cause}", source_context(source)))
+}
+
+/// The diagnostic prefix for a failing source: its diagram type keyword and its
+/// first line, clipped to [`CONTEXT_LIMIT`] characters.
+fn source_context(source: &str) -> String {
+    let mut context = String::new();
+    match diagram_type(source) {
+        Some(kind) => context.push_str(kind),
+        None => context.push_str("unknown diagram type"),
+    }
+    if let Some(line) = first_line(source) {
+        context.push_str(": `");
+        context.push_str(line);
+        context.push('`');
+    }
+    clip(&context, CONTEXT_LIMIT)
+}
+
+/// The diagram type keyword at the head of `source`.
+///
+/// Comment (`%%…`) lines, directives, blank lines, and a leading YAML front
+/// matter block are skipped, and the keyword is the first whitespace-delimited
+/// token of the first line that remains — the same rule the corpus fixtures
+/// follow, so a source that carries `title` or a direction on the keyword line
+/// still resolves. Mermaid's alternative spellings are folded onto
+/// [`supported_types`] (`graph` → `flowchart`, `stateDiagram` →
+/// `stateDiagram-v2`); a token this build does not render is still returned, so
+/// a diagnostic can name what the author wrote.
+fn diagram_type(source: &str) -> Option<&str> {
+    let mut front_matter = false;
+    let mut opened = false;
+    for raw in source.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !opened {
+            opened = true;
+            if line == "---" {
+                front_matter = true;
+                continue;
+            }
+        }
+        if front_matter {
+            if line == "---" {
+                front_matter = false;
+            }
+            continue;
+        }
+        if line.starts_with("%%") {
+            continue;
+        }
+        if let Some(token) = line.split_whitespace().next() {
+            return Some(normalize(token));
+        }
+    }
+    None
+}
+
+/// Folds a Mermaid keyword onto its canonical [`supported_types`] spelling.
+fn normalize(keyword: &str) -> &str {
+    match keyword {
+        "graph" => "flowchart",
+        "stateDiagram" => "stateDiagram-v2",
+        other => other,
+    }
+}
+
+/// The first line of `source` that is not blank, trimmed.
+fn first_line(source: &str) -> Option<&str> {
+    source.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
+/// Truncates `text` to at most `limit` characters, marking the cut with `…`.
+///
+/// Counting is in characters rather than bytes, so the result is always valid
+/// UTF-8 and no cut can split one.
+fn clip(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_owned();
+    }
+    let mut clipped: String = text.chars().take(limit.saturating_sub(1)).collect();
+    clipped.push('…');
+    clipped
 }
 
 /// Builds the SVG service set for one render.
@@ -1090,7 +1244,10 @@ mod fonts {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiagramOptions, render_svg, validate_output};
+    use super::{
+        DiagramOptions, diagram_type, parse_error, render_svg, source_context, supported_types,
+        validate_output,
+    };
 
     /// A source that renders as the smallest useful Mermaid diagram.
     const SOURCE: &str = "flowchart TD\nA --> B";
@@ -1100,6 +1257,131 @@ mod tests {
         let rejected = render_svg(" \n\t ", &DiagramOptions::default())
             .is_err_and(|failure| failure.starts_with("E_DIAGRAM_PARSE:"));
         assert!(rejected, "an empty source must fail with E_DIAGRAM_PARSE");
+    }
+
+    #[test]
+    fn type_detection_skips_comments_directives_and_front_matter() {
+        assert_eq!(diagram_type(SOURCE), Some("flowchart"));
+        assert_eq!(diagram_type("graph LR\nA --> B"), Some("flowchart"));
+        assert_eq!(
+            diagram_type("stateDiagram\n[*] --> A"),
+            Some("stateDiagram-v2")
+        );
+        assert_eq!(
+            diagram_type("  \n%% a comment\n%%{init: {}}%%\npie title Split\n\"a\" : 1"),
+            Some("pie")
+        );
+        assert_eq!(
+            diagram_type("---\ntitle: doc\n---\nmindmap\n  root((x))"),
+            Some("mindmap")
+        );
+        assert_eq!(diagram_type("%% only a comment"), None);
+        assert_eq!(diagram_type(""), None);
+    }
+
+    #[test]
+    fn parse_error_prefix_names_the_type_and_first_line() {
+        let context = source_context("flowchart TD\nA --> B");
+        assert_eq!(context, "flowchart: `flowchart TD`");
+
+        // The prefix never exceeds the context limit, and the cut is marked.
+        let long = format!("flowchart TD {}", "A".repeat(200));
+        let clipped = source_context(&long);
+        assert!(clipped.starts_with("flowchart: `flowchart TD"));
+        assert!(clipped.ends_with('…'));
+        assert!(clipped.chars().count() <= 60, "{clipped:?}");
+
+        // A source with no recognizable keyword still yields a prefix, and the
+        // cause survives the prefix unchanged.
+        let unknown = source_context("%% nothing but a comment");
+        assert!(unknown.starts_with("unknown diagram type"));
+        assert!(unknown.chars().count() <= 60);
+        let message = parse_error(&long, "boom");
+        assert!(message.starts_with("E_DIAGRAM_PARSE: "));
+        assert!(message.ends_with("boom"));
+    }
+
+    #[test]
+    fn a_malformed_diagram_reports_its_type_and_first_line() {
+        let rejected = render_svg("flowchart TD\nA[unterminated", &DiagramOptions::default())
+            .is_err_and(|failure| {
+                failure.starts_with("E_DIAGRAM_PARSE: flowchart: `flowchart TD`: ")
+            });
+        assert!(
+            rejected,
+            "a malformed flowchart must name its type and first line"
+        );
+    }
+
+    #[test]
+    fn supported_types_cover_the_diagram_corpus() {
+        let corpus = [
+            (
+                "class.mmd",
+                include_str!("../../../fixtures/diagrams/class.mmd"),
+            ),
+            ("er.mmd", include_str!("../../../fixtures/diagrams/er.mmd")),
+            (
+                "flowchart.mmd",
+                include_str!("../../../fixtures/diagrams/flowchart.mmd"),
+            ),
+            (
+                "gantt.mmd",
+                include_str!("../../../fixtures/diagrams/gantt.mmd"),
+            ),
+            (
+                "gitgraph.mmd",
+                include_str!("../../../fixtures/diagrams/gitgraph.mmd"),
+            ),
+            (
+                "journey.mmd",
+                include_str!("../../../fixtures/diagrams/journey.mmd"),
+            ),
+            (
+                "mindmap.mmd",
+                include_str!("../../../fixtures/diagrams/mindmap.mmd"),
+            ),
+            (
+                "pie.mmd",
+                include_str!("../../../fixtures/diagrams/pie.mmd"),
+            ),
+            (
+                "quadrant.mmd",
+                include_str!("../../../fixtures/diagrams/quadrant.mmd"),
+            ),
+            (
+                "sequence.mmd",
+                include_str!("../../../fixtures/diagrams/sequence.mmd"),
+            ),
+            (
+                "state.mmd",
+                include_str!("../../../fixtures/diagrams/state.mmd"),
+            ),
+            (
+                "timeline.mmd",
+                include_str!("../../../fixtures/diagrams/timeline.mmd"),
+            ),
+        ];
+
+        assert_eq!(supported_types().len(), 12);
+        for (file, source) in corpus {
+            let kind = diagram_type(source);
+            assert!(
+                kind.is_some_and(|kind| supported_types().contains(&kind)),
+                "{file} must resolve to an advertised diagram type, got {kind:?}"
+            );
+        }
+
+        // The corpus covers every advertised type, so a type is never listed
+        // without a fixture behind it.
+        let mut found: Vec<&str> = corpus
+            .iter()
+            .filter_map(|(_, source)| diagram_type(source))
+            .collect();
+        found.sort_unstable();
+        let mut advertised: Vec<&str> = supported_types().to_vec();
+        advertised.sort_unstable();
+        assert_eq!(found, advertised);
     }
 
     #[test]

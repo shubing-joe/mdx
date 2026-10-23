@@ -1,0 +1,5 @@
+# Artifacts `makepkg` writes here when it builds the recipe from this directory.
+pkg/
+src/
+*.tar.gz
+*.tar.zst

@@ -8,15 +8,22 @@
 //! wrapped line produces, which get exactly one number.
 //!
 //! The pane does no I/O, keeps no globals and reads no clock: it is a function
-//! of the buffer it is handed and [`EditorState`].
+//! of the buffer it is handed and [`EditorState`]. The one way in from the rest
+//! of the shell is [`EditorState::reveal_line`], which the outline and the
+//! diagnostics pane use to show a line: the request moves the caret through the
+//! widget's own state and scrolls the pane to the line.
 
 use std::sync::Arc;
 
-use egui::text::{CCursor, LayoutJob};
+use egui::text::{CCursor, CCursorRange, LayoutJob};
+use egui::widgets::text_edit::TextEditState;
 use egui::{
-    Align, Align2, Color32, CornerRadius, FontId, Frame, Galley, Layout, Painter, Rect, ScrollArea,
-    Sense, Stroke, TextBuffer, TextEdit, Ui, UiBuilder, Vec2, pos2,
+    Align, Align2, Color32, CornerRadius, FontId, Frame, Galley, Id, Layout, Painter, Pos2, Rect,
+    ScrollArea, Sense, Stroke, TextBuffer, TextEdit, Ui, UiBuilder, Vec2, pos2,
 };
+
+/// Salt of the pane's one `TextEdit`: the widget keeps its caret state under it.
+const TEXT_ID_SALT: &str = "mdx_source_edit";
 
 /// Smallest width the text column is allowed to shrink to, in points.
 const MIN_TEXT_WIDTH: f32 = 32.0;
@@ -35,6 +42,15 @@ pub struct EditorState {
     /// Draw a band behind the caret's line.
     pub highlight_current_line: bool,
 
+    /// Line a reveal asked for, applied by the next [`EditorState::show`].
+    pending_reveal: Option<usize>,
+    /// Line the last reveal landed on, banded until the buffer changes under it.
+    revealed_line: Option<usize>,
+    /// Id of the pane's `TextEdit`, learned from the first frame it was drawn:
+    /// a reveal moves the caret through the widget's state, which is keyed by
+    /// that id.
+    text_id: Option<Id>,
+
     /// 1-based caret line, as measured on the last frame.
     caret_line: usize,
     /// 1-based caret column, as measured on the last frame.
@@ -51,6 +67,9 @@ impl Default for EditorState {
         Self {
             show_line_numbers: true,
             highlight_current_line: true,
+            pending_reveal: None,
+            revealed_line: None,
+            text_id: None,
             caret_line: 1,
             caret_column: 1,
             origin_fix: 0.0,
@@ -69,6 +88,22 @@ impl EditorState {
     #[must_use]
     pub fn caret_column(&self) -> usize {
         self.caret_column
+    }
+
+    /// Ask the pane to show `line` (1-based): the next [`EditorState::show`]
+    /// scrolls to it, moves the caret to its first character and bands it.
+    ///
+    /// A line past the end of the buffer clamps to the last line, so a stale
+    /// line number from an outline or a diagnostic can never scroll the pane
+    /// past the text.
+    pub fn reveal_line(&mut self, line: usize) {
+        self.pending_reveal = Some(line.max(1));
+    }
+
+    /// Line the last reveal landed on, if the buffer has not changed since.
+    #[must_use]
+    pub fn revealed_line(&self) -> Option<usize> {
+        self.revealed_line
     }
 
     /// Draw the source pane for `text`.
@@ -91,12 +126,22 @@ impl EditorState {
         let show_numbers = self.show_line_numbers;
         let highlight_line = self.highlight_current_line;
         let caret_line = self.caret_line.max(1);
-        let digits = decimal_digits(count_lines(text));
+        let text_lines = count_lines(text);
+        let digits = decimal_digits(text_lines);
         let spacing = ui.spacing().item_spacing.x;
         let origin_fix = self.origin_fix;
 
+        // A reveal asked for by the shell: the bands are painted from the line
+        // it names, and the caret and the scroll are applied below, once the
+        // widget has laid the buffer out. The line stays pending until it has
+        // been applied, which needs the widget's id from the previous frame.
+        let reveal = self.pending_reveal.map(|line| line.min(text_lines));
+        let band_line = reveal.or(self.revealed_line);
+        let reveal_band = ui.visuals().selection.bg_fill;
+
         let mut changed = false;
         let mut caret = None;
+        let mut revealed = None;
 
         ScrollArea::vertical()
             .id_salt("mdx_source_scroll")
@@ -131,8 +176,11 @@ impl EditorState {
 
                     let painter = ui.painter();
                     painter.rect_filled(content, CornerRadius::ZERO, backdrop);
+                    if let Some(line) = band_line {
+                        paint_line_band(painter, &galley, content, text_top, line, reveal_band);
+                    }
                     if highlight_line {
-                        paint_caret_band(painter, &galley, content, text_top, caret_line, band);
+                        paint_line_band(painter, &galley, content, text_top, caret_line, band);
                     }
                     if show_numbers {
                         paint_gutter(
@@ -184,8 +232,21 @@ impl EditorState {
                                 .layout(Layout::top_down(Align::Min))
                                 .id_salt("mdx_source_text"),
                             |ui| {
+                                // A reveal moves the caret through the widget's
+                                // own state, keyed by the id the widget was
+                                // drawn under last frame.
+                                if let (Some(line), Some(editor_id)) = (reveal, self.text_id) {
+                                    let index = CCursor::new(line_start_char_index(text, line));
+                                    let mut state = TextEditState::load(ui.ctx(), editor_id)
+                                        .unwrap_or_default();
+                                    state.cursor.set_char_range(Some(CCursorRange::one(index)));
+                                    state.store(ui.ctx(), editor_id);
+                                    ui.memory_mut(|memory| memory.request_focus(editor_id));
+                                    revealed = Some(line);
+                                }
+
                                 TextEdit::multiline(text)
-                                    .id_salt("mdx_source_edit")
+                                    .id_salt(TEXT_ID_SALT)
                                     .font(font_id.clone())
                                     // No frame and no margin: the pane paints its
                                     // own background, and a zero inner margin is
@@ -208,6 +269,8 @@ impl EditorState {
                         .inner;
 
                     self.origin_fix = output.galley_pos.y - text_rect.min.y;
+                    // The id the next reveal has to move the caret through.
+                    self.text_id = Some(output.response.response.id);
                     // `WidgetAtomResponse` derefs to the widget's `Response`; go
                     // through the field so the change flag is unambiguous.
                     changed |= output.response.response.changed();
@@ -216,6 +279,21 @@ impl EditorState {
                             &output.galley,
                             CCursor::new(range.primary.index),
                         ));
+                    }
+
+                    if let Some(line) = revealed {
+                        // The widget does not follow a caret it did not move
+                        // itself, so the pane scrolls the revealed line in: the
+                        // enclosing scroll area takes this pass's target.
+                        self.pending_reveal = None;
+                        self.revealed_line = Some(line);
+                        if let Some(rect) =
+                            line_rect(&output.galley, output.galley_pos, text_width, line)
+                        {
+                            ui.scroll_to_rect(rect, Some(Align::Center));
+                        }
+                    } else if changed {
+                        self.revealed_line = None;
                     }
                 });
             });
@@ -296,18 +374,18 @@ fn paint_gutter(
     painter.vline(gutter_right, top..=bottom, separator);
 }
 
-/// Paint a band across `content` behind every row of `caret_line`.
-fn paint_caret_band(
+/// Paint a band across `content` behind every row of `line`.
+fn paint_line_band(
     painter: &Painter,
     galley: &Galley,
     content: Rect,
     text_top: f32,
-    caret_line: usize,
+    line: usize,
     band: Color32,
 ) {
-    let mut line = 1usize;
+    let mut current = 1usize;
     for placed in &galley.rows {
-        if line == caret_line {
+        if current == line {
             let row_top = text_top + placed.pos.y;
             painter.rect_filled(
                 Rect::from_min_max(
@@ -319,9 +397,59 @@ fn paint_caret_band(
             );
         }
         if placed.ends_with_newline {
-            line += 1;
+            current += 1;
         }
     }
+}
+
+/// Rectangle covered by the rows of `line` in a galley laid out at `origin`,
+/// or `None` when the galley has no such line.
+///
+/// Wrapping means a line can own several rows; the rectangle spans them all, so
+/// a revealed line is scrolled to as a whole.
+fn line_rect(galley: &Galley, origin: Pos2, width: f32, line: usize) -> Option<Rect> {
+    let mut current = 1usize;
+    let mut span = None;
+
+    for placed in &galley.rows {
+        if current == line {
+            let row_top = origin.y + placed.pos.y;
+            let row_bottom = row_top + placed.row.size.y;
+            span = Some(match span {
+                Some((top, _)) => (top, row_bottom),
+                None => (row_top, row_bottom),
+            });
+        }
+        if placed.ends_with_newline {
+            current += 1;
+        }
+    }
+
+    let (top, bottom) = span?;
+    Some(Rect::from_min_size(
+        pos2(origin.x, top),
+        Vec2::new(width, bottom - top),
+    ))
+}
+
+/// Index of the first `char` of `line` (1-based), clamped to the buffer.
+///
+/// This is what a `CCursor` counts, and what makes a revealed line's caret land
+/// on its first character instead of at the end of the buffer.
+fn line_start_char_index(text: &str, line: usize) -> usize {
+    let preceding_newlines = line.saturating_sub(1);
+    let mut seen = 0usize;
+    let mut index = 0usize;
+    for character in text.chars() {
+        if seen >= preceding_newlines {
+            break;
+        }
+        index += 1;
+        if character == '\n' {
+            seen += 1;
+        }
+    }
+    index
 }
 
 /// Line and column (both 1-based) of `cursor`, in logical lines: rows produced

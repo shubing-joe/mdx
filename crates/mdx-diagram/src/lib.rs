@@ -7,7 +7,10 @@
 //!   no `<foreignObject>` HTML labels, so resvg/usvg-based consumers — the Typst
 //!   page preview and the self-contained HTML output — can rasterize it;
 //! * [`cache`] derives the content-addressed key callers use to memoize that
-//!   work and to give each diagram a document-unique id.
+//!   work and to give each diagram a document-unique id, and holds the advisory
+//!   on-disk store (`load`/`store`) that spares a later run the same render.
+//!
+//! [`supported_types`] lists the diagram kinds this build renders.
 //!
 //! Rendering is deterministic and host independent: the same source and options
 //! produce the same bytes, ids included. See [`render`] for the metric sources
@@ -18,6 +21,7 @@
 //! let options = mdx_diagram::DiagramOptions::default();
 //! let svg = mdx_diagram::render_svg("flowchart TD\nA[Start] --> B[Done]", &options)?;
 //! assert!(svg.starts_with("<svg"));
+//! assert!(mdx_diagram::supported_types().contains(&"flowchart"));
 //! # Ok(())
 //! # }
 //! ```
@@ -28,4 +32,4 @@ pub mod cache;
 pub mod render;
 
 pub use cache::{Memo, key as cache_key};
-pub use render::{DiagramOptions, render_svg};
+pub use render::{DiagramOptions, render_svg, supported_types};

@@ -262,8 +262,8 @@ mod tests {
                 }
             }
         }
-        assert_eq!(checked, 55, "expected 55 valid fixtures in {dir:?}");
-        assert_eq!(bad, 5, "expected 5 malformed fixtures in {dir:?}");
+        assert_eq!(checked, 85, "expected 85 valid fixtures in {dir:?}");
+        assert_eq!(bad, 10, "expected 10 malformed fixtures in {dir:?}");
     }
 
     fn corpus_dir() -> PathBuf {

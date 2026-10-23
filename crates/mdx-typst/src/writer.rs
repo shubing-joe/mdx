@@ -13,6 +13,18 @@
 //! - diagrams → [`diagram_path`] (`/diagrams/<key>.svg`), keyed by
 //!   [`diagram_key`] (FNV-1a 64 of the exact mermaid source).
 //!
+//! Layout follows print conventions instead of Typst's bare defaults, all of it
+//! emitted in `push_setup` and in the block writer:
+//!
+//! - headings are unbreakable and sticky, so none of them ever ends a page
+//!   alone,
+//! - tables and page-sized images are kept in one piece (`breakable: false`),
+//! - an image wider than the text column is scaled down to it, and never
+//!   enlarged past its intrinsic size,
+//! - lists are tightened to `0.65em` between items,
+//! - a document that has footnotes separates them from the body with a
+//!   full-width rule.
+//!
 //! Anything the world cannot serve degrades instead of dangling: an image whose
 //! asset did not resolve becomes its alternative text, a diagram that was not
 //! rendered becomes a `mermaid` code block, an unknown footnote reference
@@ -36,6 +48,7 @@ use std::fmt::Write as _;
 use mdx_assets::AssetStore;
 use mdx_core::{Align, AssetId, AssetKind, Block, Doc, Inline};
 
+use super::page::{margins, page_size};
 use super::{DiagramMap, MathMap, Paper, RenderOptions};
 
 /// Virtual path prefix for resolved assets (`asset_path`).
@@ -71,6 +84,11 @@ const FONT_STACK: &[&str] = &[
 /// otherwise be poured into the PDF verbatim.
 const IMAGE_PLACEHOLDER: &str = "[image]";
 
+/// Share of the page height an image may take up and still be kept in one
+/// piece. A taller image stays breakable so it can spill onto the following
+/// page instead of overflowing this one.
+const IMAGE_PAGE_FRACTION: f32 = 0.8;
+
 /// Build the complete Typst source for `doc`.
 ///
 /// The result is deterministic and self-contained: page setup, text/paragraph
@@ -85,9 +103,13 @@ pub fn build(
     opts: &RenderOptions,
 ) -> String {
     let notes = Footnotes::collect(&doc.blocks);
+    // The footnote separator rule is only worth emitting for a document that
+    // has a footnote at all.
+    let has_footnotes = !notes.is_empty();
+    let (text_width_pt, page_height_pt) = page_geometry(opts);
 
     let mut out = String::with_capacity(4096);
-    push_setup(&mut out, opts);
+    push_setup(&mut out, opts, has_footnotes);
     if opts.toc {
         push_directive(&mut out, "#outline(title: [目录], indent: auto)");
     }
@@ -103,6 +125,8 @@ pub fn build(
         diagrams,
         notes: &notes,
         placed_notes: BTreeSet::new(),
+        text_width_pt,
+        page_height_pt,
     };
     writer.blocks(&doc.blocks, &mut out);
 
@@ -176,7 +200,7 @@ fn push_directive(out: &mut String, directive: &str) {
     out.push_str(directive);
 }
 
-fn push_setup(out: &mut String, opts: &RenderOptions) {
+fn push_setup(out: &mut String, opts: &RenderOptions, has_footnotes: bool) {
     if let Some(title) = opts.title.as_deref() {
         let mut document = String::from("#set document(title: ");
         push_string(title, &mut document);
@@ -205,6 +229,54 @@ fn push_setup(out: &mut String, opts: &RenderOptions) {
     push_directive(out, &text);
 
     push_directive(out, "#set par(justify: true)");
+
+    // Print default for both kinds of list: items sit closer together than the
+    // paragraph leading/spacing Typst would otherwise use between them.
+    // API: https://typst.app/docs/reference/model/list/#parameters-spacing
+    // API: https://typst.app/docs/reference/model/enum/#parameters-spacing
+    push_directive(out, "#set list(spacing: 0.65em)");
+    push_directive(out, "#set enum(spacing: 0.65em)");
+
+    // A heading must never end a page on its own: `sticky` keeps it with the
+    // block that follows it, `breakable: false` keeps a multi-line heading in
+    // one piece. Typst already sets `sticky: true` on heading blocks through
+    // its built-in show-set rule, so this states the requirement — and the
+    // `breakable` half Typst does not set at all — instead of relying on a
+    // default that may move.
+    // API: https://typst.app/docs/reference/layout/block/#parameters-sticky
+    // API: https://typst.app/docs/reference/layout/block/#parameters-breakable
+    push_directive(
+        out,
+        "#show heading: set block(breakable: false, sticky: true)",
+    );
+
+    // Footnotes get a full-width rule above their listing on every page that
+    // has one, replacing Typst's 30%-wide default. `line()` defaults to 30pt,
+    // so the length is spelled out.
+    // API: https://typst.app/docs/reference/model/footnote/ (footnote.entry)
+    // API: https://typst.app/docs/reference/visualize/line/#parameters-length
+    //
+    // Only a document that mentions a footnote needs it, and it has to be a
+    // top-level rule: footnote entry properties must be uniform across each
+    // page run and are meant to be set before any page content.
+    if has_footnotes {
+        // A separator is content, so the rule it holds can be written in
+        // markup, with the `#line` call a reader expects.
+        let separator = "#set footnote.entry(separator: [#line(length: 100%)])";
+        push_directive(out, separator);
+    }
+}
+
+/// The text column width and the page height of `opts`, in points.
+///
+/// The margin is normalised exactly like the emitted `#set page(…)` length, so
+/// the geometry the writer reasons about is the geometry Typst lays out. Typst
+/// clips a margin larger than the page, hence the floor at zero: an empty
+/// column is the right model for it, not a negative one.
+fn page_geometry(opts: &RenderOptions) -> (f32, f32) {
+    let (page_width, page_height) = page_size(&opts.page.paper);
+    let (margin, ..) = margins(normalized_mm(opts.page.margin_mm));
+    ((page_width - 2.0 * margin).max(0.0), page_height)
 }
 
 /// Typst paper name for a [`Paper`] variant.
@@ -216,10 +288,17 @@ fn paper_name(paper: Paper) -> &'static str {
     }
 }
 
-/// Append a millimetre length. Negative, non-finite and `-0` margins collapse
-/// to `0mm` so the emitted length is always well formed.
+/// Normalise a length in millimetres: negative, non-finite and `-0` values
+/// collapse to `0`, so both the formatted length and any geometry derived from
+/// it are well formed.
+fn normalized_mm(mm: f32) -> f32 {
+    if mm.is_finite() && mm > 0.0 { mm } else { 0.0 }
+}
+
+/// Append a millimetre length, normalised by [`normalized_mm`] so the emitted
+/// length is always well formed.
 fn push_mm(out: &mut String, mm: f32) {
-    let mm = if mm.is_finite() && mm > 0.0 { mm } else { 0.0 };
+    let mm = normalized_mm(mm);
     let _ = write!(out, "{mm}mm");
 }
 
@@ -412,6 +491,13 @@ impl<'a> Footnotes<'a> {
             referenced,
         }
     }
+
+    /// Whether the document has no footnote at all — neither a definition nor
+    /// a reference. The separator rule is only worth emitting when it is not
+    /// empty.
+    fn is_empty(&self) -> bool {
+        self.defs.is_empty() && self.referenced.is_empty()
+    }
 }
 
 /// Keep only characters that are valid inside a Typst label literal.
@@ -501,6 +587,10 @@ struct Writer<'a> {
     notes: &'a Footnotes<'a>,
     /// labels whose body has already been typeset at a reference site.
     placed_notes: BTreeSet<String>,
+    /// Width of the text column in points (page width minus both margins).
+    text_width_pt: f32,
+    /// Height of a full page in points.
+    page_height_pt: f32,
 }
 
 impl Writer<'_> {
@@ -527,6 +617,11 @@ impl Writer<'_> {
             Block::Heading { level, inlines, .. } => {
                 // Markdown levels are 1..=6; clamp so a malformed level can
                 // never emit zero markers (which would be plain text).
+                //
+                // The heading stays `=`-markup (rather than a `#block(…)`
+                // wrapper) so the outline and the PDF bookmarks still see a
+                // real heading element; the setup rule is what makes its block
+                // unbreakable and sticky.
                 for _ in 0..(*level).clamp(1, 6) {
                     out.push('=');
                 }
@@ -551,9 +646,14 @@ impl Writer<'_> {
                 }
             }
             Block::Image {
-                asset, src, alt, ..
+                asset,
+                src,
+                alt,
+                width,
+                height,
+                ..
             } => {
-                self.image(asset.as_ref(), src, alt, out);
+                self.image(asset.as_ref(), src, alt, *width, *height, true, out);
             }
             Block::List {
                 ordered,
@@ -568,7 +668,7 @@ impl Writer<'_> {
                 aligns,
                 header,
                 rows,
-            } => self.table(aligns, header, rows, out),
+            } => self.table_block(aligns, header, rows, out),
             Block::ThematicBreak => out.push_str("#line(length: 100%)"),
             // Typst has no HTML passthrough; the block is dropped.
             Block::Html { .. } => {}
@@ -631,12 +731,45 @@ impl Writer<'_> {
             // Typst ends an item at the first line that is not (parser:
             // `AtNewline::RequireColumn`).
             let mut body = String::new();
-            self.blocks(item, &mut body);
+            self.list_item(item, &mut body);
             if !body.is_empty() {
                 out.push(' ');
                 push_item_body(&body, out);
             }
         }
+    }
+
+    /// Render one list item body.
+    ///
+    /// An item whose first line is a paragraph of its own is kept together with
+    /// the rest of the item: the paragraph becomes a sticky block, so a break
+    /// between it and the item's remaining blocks migrates both to the next
+    /// page instead of leaving the item's first line alone at the bottom of
+    /// this one. Items that hold a single block need no such glue — wrapping
+    /// them would glue the item to the *next* item as well and make a long list
+    /// unbreakable — and neither do items that open with an image or a table,
+    /// which [`Writer::image`] and [`Writer::table_block`] already keep whole.
+    /// API: https://typst.app/docs/reference/layout/block/#parameters-sticky
+    fn list_item(&mut self, blocks: &[Block], out: &mut String) {
+        let [Block::Paragraph { inlines }, rest @ ..] = blocks else {
+            return self.blocks(blocks, out);
+        };
+        // An empty first paragraph has no line to keep, and a single-block item
+        // has nothing to keep it with.
+        if inlines.is_empty() || rest.is_empty() {
+            return self.blocks(blocks, out);
+        }
+        // The first line is rendered before the rest, so anything stateful —
+        // a footnote definition placed at its first reference, for one — stays
+        // in document order.
+        out.push_str("#block(sticky: true)[");
+        self.inlines(inlines, out);
+        out.push(']');
+        // The remaining blocks are the item's own, one blank line later.
+        // `blocks` never separates from content already in the buffer, so the
+        // separator has to come from here.
+        out.push_str("\n\n");
+        self.blocks(rest, out);
     }
 
     fn block_quote(&mut self, blocks: &[Block], out: &mut String) {
@@ -648,6 +781,29 @@ impl Writer<'_> {
         out.push_str("#quote(block: true)[\n");
         push_indented(&inner, 2, out);
         out.push_str("\n]");
+    }
+
+    /// Render one table as a single unbreakable block.
+    ///
+    /// A table is read as one unit, so it is never split across pages: its
+    /// caption-less body goes into `#block(breakable: false)`, which keeps
+    /// rows and their header together on one page.
+    /// API: https://typst.app/docs/reference/layout/block/#parameters-breakable
+    fn table_block(
+        &mut self,
+        aligns: &[Align],
+        header: &[Vec<Inline>],
+        rows: &[Vec<Vec<Inline>>],
+        out: &mut String,
+    ) {
+        let mut table = String::new();
+        self.table(aligns, header, rows, &mut table);
+        if table.is_empty() {
+            return;
+        }
+        out.push_str("#block(breakable: false)[");
+        out.push_str(&table);
+        out.push(']');
     }
 
     fn table(
@@ -746,7 +902,7 @@ impl Writer<'_> {
             }
             Inline::Image {
                 asset, src, alt, ..
-            } => self.image(asset.as_ref(), src, alt, out),
+            } => self.image(asset.as_ref(), src, alt, None, None, false, out),
             Inline::Math { latex, display } => self.math(latex, *display, out),
             Inline::FootnoteRef { label } => self.footnote_ref(label, out),
             Inline::LineBreak { hard } => {
@@ -770,29 +926,95 @@ impl Writer<'_> {
 
     /// Emit an image, or its alternative text when the asset is missing or not
     /// an image: a dangling virtual path would fail the compile.
-    fn image(&self, asset: Option<&AssetId>, src: &str, alt: &str, out: &mut String) {
+    ///
+    /// A resolved image is scaled down to the text column when its intrinsic
+    /// size is wider than the column — a percentage width is relative to the
+    /// text width — and is never enlarged, because a narrower image keeps its
+    /// intrinsic size. A block image that fits on one page additionally goes
+    /// into an unbreakable block: a picture split by a page break is not what a
+    /// reader expects, while one taller than a page has to stay breakable to
+    /// avoid overflowing.
+    ///
+    /// `width`/`height` are the pixel dimensions the markdown carried or
+    /// `mdx-assets` filled in from the payload; whatever they leave open is
+    /// taken from the resolved asset.
+    // Every field is an independent Markdown image attribute; grouping them
+    // into a struct would only move the same list to the call sites.
+    // API: https://typst.app/docs/reference/visualize/image/#parameters-width
+    #[allow(clippy::too_many_arguments)]
+    fn image(
+        &self,
+        asset: Option<&AssetId>,
+        src: &str,
+        alt: &str,
+        width: Option<u32>,
+        height: Option<u32>,
+        block: bool,
+        out: &mut String,
+    ) {
         let resolved = asset.and_then(|id| self.assets.get(id));
-        match (asset, resolved) {
-            (Some(id), Some(asset)) if asset.kind == AssetKind::Image => {
-                out.push_str("#image(");
-                push_string(&asset_path(id.as_str()), out);
-                if !alt.is_empty() {
-                    out.push_str(", alt: ");
-                    push_string(alt, out);
-                }
-                out.push(')');
-            }
-            _ => {
-                let label = if !alt.is_empty() {
-                    alt
-                } else if src.starts_with("data:") {
-                    IMAGE_PLACEHOLDER
-                } else {
-                    src
-                };
-                push_text(label, out);
-            }
+        let (Some(id), Some(stored)) = (asset, resolved) else {
+            return image_alt(src, alt, out);
+        };
+        if stored.kind != AssetKind::Image {
+            return image_alt(src, alt, out);
         }
+
+        let pixels = match (width.or(stored.width), height.or(stored.height)) {
+            (Some(width), Some(height)) => Some((width, height)),
+            _ => None,
+        };
+
+        let mut image = String::from("#image(");
+        push_string(&asset_path(id.as_str()), &mut image);
+        if !alt.is_empty() {
+            image.push_str(", alt: ");
+            push_string(alt, &mut image);
+        }
+        if pixels.is_some_and(|pixels| self.overflows_text_width(pixels)) {
+            image.push_str(", width: 100%");
+        }
+        image.push(')');
+
+        if block && pixels.is_some_and(|pixels| self.fits_one_page(pixels)) {
+            out.push_str("#block(breakable: false)[");
+            out.push_str(&image);
+            out.push(']');
+        } else {
+            out.push_str(&image);
+        }
+    }
+
+    /// Whether an image renders wider than the text column.
+    ///
+    /// Typst lays an image without an explicit `width` out at its intrinsic
+    /// size, `pixels / dpi` inches per axis, where `dpi` falls back to
+    /// `Image::DEFAULT_DPI` — 72 — for a payload without resolution metadata.
+    /// One pixel is therefore one point here: the closest the manifest can get,
+    /// since it records pixel dimensions but no pixel density.
+    // API: https://docs.rs/typst-library/0.15.1/typst_library/visualize/struct.Image.html#associatedconstant.DEFAULT_DPI
+    fn overflows_text_width(&self, pixels: (u32, u32)) -> bool {
+        let (width, _) = pixels;
+        width as f32 > self.text_width_pt
+    }
+
+    /// Whether an image stays within [`IMAGE_PAGE_FRACTION`] of the page height
+    /// at the width it is rendered at, i.e. whether it can be kept in one
+    /// piece.
+    ///
+    /// The rendered width is the one [`Writer::overflows_text_width`] selects:
+    /// the text column for a scaled-down image, the intrinsic width otherwise.
+    /// An image whose pixel size is unknown cannot be shown to fit and stays
+    /// breakable.
+    fn fits_one_page(&self, pixels: (u32, u32)) -> bool {
+        let (width, height) = pixels;
+        if width == 0 || height == 0 {
+            return false;
+        }
+        let intrinsic_width = width as f32;
+        let rendered_width = intrinsic_width.min(self.text_width_pt);
+        let rendered_height = rendered_width * (height as f32 / intrinsic_width);
+        rendered_height <= self.page_height_pt * IMAGE_PAGE_FRACTION
     }
 
     /// Emit a footnote reference.
@@ -860,6 +1082,20 @@ impl Writer<'_> {
     }
 }
 
+/// Append the text an image degrades to when it has no usable asset: the
+/// alternative text, the placeholder for a `data:` URI (whose payload would
+/// otherwise be poured into the PDF verbatim) or the source path.
+fn image_alt(src: &str, alt: &str, out: &mut String) {
+    let label = if !alt.is_empty() {
+        alt
+    } else if src.starts_with("data:") {
+        IMAGE_PLACEHOLDER
+    } else {
+        src
+    };
+    push_text(label, out);
+}
+
 /// Append the continuation lines of a list item: the first line stays on the
 /// marker line, every following non-empty line is indented by two spaces.
 fn push_item_body(body: &str, out: &mut String) {
@@ -887,5 +1123,348 @@ fn push_indented(text: &str, indent: usize, out: &mut String) {
             }
         }
         out.push_str(line);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mdx_assets::{Asset, AssetStore};
+    use mdx_core::{Align, AssetId, AssetKind, Block, Doc, Inline};
+
+    use crate::{DiagramMap, MathMap, PageSetup, RenderOptions};
+
+    use super::build;
+
+    /// The page set-up the CLI renders with: A4, 20 mm margins, numbered.
+    ///
+    /// The text column of that set-up is 481.89 pt wide and the page 841.89 pt
+    /// high, which is what the image assertions below assume.
+    fn options() -> RenderOptions {
+        RenderOptions {
+            page: PageSetup::default(),
+            toc: false,
+            pdf_standard: None,
+            fonts: Vec::new(),
+            ignore_system_fonts: true,
+            deterministic_today: None,
+            title: None,
+        }
+    }
+
+    fn source_of(blocks: Vec<Block>, assets: &AssetStore) -> String {
+        let doc = Doc::new(blocks);
+        build(
+            &doc,
+            assets,
+            &MathMap::new(),
+            &DiagramMap::new(),
+            &options(),
+        )
+    }
+
+    /// Build against an empty asset store.
+    fn build_blocks(blocks: Vec<Block>) -> String {
+        source_of(blocks, &AssetStore::new())
+    }
+
+    fn inlines(text: &str) -> Vec<Inline> {
+        vec![Inline::Text {
+            text: text.to_owned(),
+        }]
+    }
+
+    fn paragraph(text: &str) -> Block {
+        Block::Paragraph {
+            inlines: inlines(text),
+        }
+    }
+
+    fn list(items: Vec<Vec<Block>>) -> Block {
+        Block::List {
+            ordered: false,
+            start: None,
+            tight: false,
+            items,
+        }
+    }
+
+    /// A store holding one image asset, with `pixels` as its manifest size.
+    fn image_store(id: &str, pixels: Option<(u32, u32)>) -> AssetStore {
+        let (width, height) = match pixels {
+            Some((width, height)) => (Some(width), Some(height)),
+            None => (None, None),
+        };
+        let mut store = AssetStore::new();
+        store.insert(Asset {
+            id: AssetId(id.to_owned()),
+            kind: AssetKind::Image,
+            origin: "pic.png".to_owned(),
+            mime: "image/png".to_owned(),
+            bytes: Vec::new(),
+            sha256: String::new(),
+            width,
+            height,
+        });
+        store
+    }
+
+    /// A block image whose asset is resolved, with the manifest's pixel size.
+    fn image_block(id: &str, width: Option<u32>, height: Option<u32>) -> Block {
+        Block::Image {
+            asset: Some(AssetId(id.to_owned())),
+            src: "pic.png".to_owned(),
+            alt: String::new(),
+            title: None,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn headings_are_unbreakable_and_sticky() {
+        let blocks = vec![
+            Block::Heading {
+                level: 1,
+                id: "intro".to_owned(),
+                inlines: inlines("Intro"),
+            },
+            paragraph("Body"),
+        ];
+        let source = build_blocks(blocks);
+        assert!(
+            source.contains("#show heading: set block(breakable: false, sticky: true)"),
+            "{source}"
+        );
+
+        // The heading stays markup, so the outline and the PDF bookmarks see a
+        // real heading element.
+        assert!(source.contains("= Intro"), "{source}");
+    }
+
+    #[test]
+    fn both_kinds_of_list_are_tightened() {
+        let source = build_blocks(vec![list(vec![vec![paragraph("only")]])]);
+        assert!(source.contains("#set list(spacing: 0.65em)"), "{source}");
+        assert!(source.contains("#set enum(spacing: 0.65em)"), "{source}");
+    }
+
+    #[test]
+    fn a_multi_block_item_keeps_its_first_line_with_the_item() {
+        let source = build_blocks(vec![list(vec![vec![
+            paragraph("first"),
+            paragraph("second"),
+        ]])]);
+        assert!(source.contains("- #block(sticky: true)[first]"), "{source}");
+        assert!(source.contains("\n\n  second"), "{source}");
+    }
+
+    #[test]
+    fn a_single_block_item_stays_plain_markup() {
+        let source = build_blocks(vec![list(vec![vec![paragraph("only")]])]);
+        assert!(source.contains("- only"), "{source}");
+        assert!(!source.contains("#block(sticky: true)"), "{source}");
+    }
+
+    #[test]
+    fn tables_are_kept_in_one_piece() {
+        let table = Block::Table {
+            aligns: vec![Align::None],
+            header: vec![inlines("H")],
+            rows: vec![vec![inlines("D")]],
+        };
+        let source = build_blocks(vec![table]);
+        assert!(
+            source.contains("#block(breakable: false)[#table("),
+            "{source}"
+        );
+        // The wrapper closes after the table's own closing parenthesis.
+        assert!(source.contains("\n)]"), "{source}");
+    }
+
+    #[test]
+    fn a_wide_image_is_scaled_to_the_text_column() {
+        let store = image_store("img-wide", Some((1200, 600)));
+        let source = source_of(vec![image_block("img-wide", Some(1200), Some(600))], &store);
+        // 1200 px is wider than the 481.89 pt column, and 600/1200 of that
+        // column is far below 80 % of the page height.
+        assert!(
+            source.contains(r#"[#image("/assets/img-wide", width: 100%)]"#),
+            "{source}"
+        );
+        assert!(source.contains("#block(breakable: false)"), "{source}");
+    }
+
+    #[test]
+    fn an_image_keeps_its_alt_text_ahead_of_the_width() {
+        let store = image_store("img-alt", Some((1200, 600)));
+        let block = Block::Image {
+            asset: Some(AssetId("img-alt".to_owned())),
+            src: "pic.png".to_owned(),
+            alt: "a photo".to_owned(),
+            title: None,
+            width: Some(1200),
+            height: Some(600),
+        };
+        let source = source_of(vec![block], &store);
+        assert!(
+            source.contains(r#"[#image("/assets/img-alt", alt: "a photo", width: 100%)]"#),
+            "{source}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_image_keeps_its_intrinsic_size() {
+        let store = image_store("img-narrow", Some((320, 200)));
+        let source = source_of(
+            vec![image_block("img-narrow", Some(320), Some(200))],
+            &store,
+        );
+        // No `width` argument: Typst uses the intrinsic size and never scales
+        // the image up to the column.
+        assert!(
+            source.contains(r#"#block(breakable: false)[#image("/assets/img-narrow")]"#),
+            "{source}"
+        );
+    }
+
+    #[test]
+    fn an_image_taller_than_a_page_stays_breakable() {
+        let store = image_store("img-tall", Some((300, 4000)));
+        let source = source_of(vec![image_block("img-tall", Some(300), Some(4000))], &store);
+        assert!(source.contains(r#"#image("/assets/img-tall")"#), "{source}");
+        assert!(!source.contains("#block(breakable: false)"), "{source}");
+    }
+
+    #[test]
+    fn an_image_wider_than_the_column_but_taller_than_a_page_is_only_scaled() {
+        let store = image_store("img-both", Some((1200, 4000)));
+        let source = source_of(
+            vec![image_block("img-both", Some(1200), Some(4000))],
+            &store,
+        );
+        assert!(
+            source.contains(r#"#image("/assets/img-both", width: 100%)"#),
+            "{source}"
+        );
+        assert!(!source.contains("#block(breakable: false)"), "{source}");
+    }
+
+    #[test]
+    fn an_image_without_dimensions_is_left_alone() {
+        let store = image_store("img-unknown", None);
+        let source = source_of(vec![image_block("img-unknown", None, None)], &store);
+        assert!(
+            source.contains(r#"#image("/assets/img-unknown")"#),
+            "{source}"
+        );
+        assert!(!source.contains("width:"), "{source}");
+        assert!(!source.contains("#block(breakable: false)"), "{source}");
+    }
+
+    #[test]
+    fn the_manifest_fills_in_the_size_the_block_left_open() {
+        let store = image_store("img-fill", Some((1200, 600)));
+        let source = source_of(vec![image_block("img-fill", None, None)], &store);
+        assert!(
+            source.contains(r#"#image("/assets/img-fill", width: 100%)"#),
+            "{source}"
+        );
+    }
+
+    #[test]
+    fn an_inline_image_is_never_wrapped_in_a_block() {
+        let store = image_store("img-inline", Some((1200, 600)));
+        let only_image = Block::Paragraph {
+            inlines: vec![Inline::Image {
+                asset: Some(AssetId("img-inline".to_owned())),
+                src: "pic.png".to_owned(),
+                alt: String::new(),
+                title: None,
+            }],
+        };
+        let source = source_of(vec![only_image], &store);
+        assert!(
+            source.contains(r#"#image("/assets/img-inline", width: 100%)"#),
+            "{source}"
+        );
+        assert!(!source.contains("#block(breakable: false)"), "{source}");
+    }
+
+    #[test]
+    fn footnotes_get_a_separator_rule() {
+        let blocks = vec![
+            Block::Paragraph {
+                inlines: vec![Inline::FootnoteRef {
+                    label: "1".to_owned(),
+                }],
+            },
+            Block::FootnoteDef {
+                label: "1".to_owned(),
+                blocks: vec![paragraph("note")],
+            },
+        ];
+        let source = build_blocks(blocks);
+        assert!(
+            source.contains("#set footnote.entry(separator: [#line(length: 100%)])"),
+            "{source}"
+        );
+    }
+
+    #[test]
+    fn a_document_without_footnotes_gets_no_separator_rule() {
+        let source = build_blocks(vec![paragraph("body")]);
+        assert!(!source.contains("footnote.entry"), "{source}");
+    }
+
+    #[test]
+    fn an_empty_document_is_just_the_setup() {
+        let source = build_blocks(Vec::new());
+        assert!(
+            source.starts_with("#set page(paper: \"a4\", margin: 20mm, numbering: \"1\")\n"),
+            "{source}"
+        );
+        assert!(source.ends_with('\n'), "{source}");
+        assert!(!source.contains("footnote.entry"), "{source}");
+    }
+
+    #[test]
+    fn an_unresolved_image_degrades_to_its_alternative_text() {
+        let block = Block::Image {
+            asset: None,
+            src: "missing.png".to_owned(),
+            alt: "a photo".to_owned(),
+            title: None,
+            width: None,
+            height: None,
+        };
+        let source = build_blocks(vec![block]);
+        assert!(source.trim_end().ends_with("a photo"), "{source}");
+    }
+
+    #[test]
+    fn an_unresolved_data_uri_image_degrades_to_the_placeholder() {
+        let block = Block::Image {
+            asset: None,
+            src: "data:image/png;base64,AAAA".to_owned(),
+            alt: String::new(),
+            title: None,
+            width: None,
+            height: None,
+        };
+        let source = build_blocks(vec![block]);
+        // `[` and `]` are escaped so the placeholder stays plain text.
+        assert!(source.trim_end().ends_with(r"\[image\]"), "{source}");
+    }
+
+    #[test]
+    fn the_same_document_always_builds_the_same_source() {
+        let store = image_store("img-wide", Some((1200, 600)));
+        let blocks = || {
+            vec![
+                image_block("img-wide", Some(1200), Some(600)),
+                paragraph("body"),
+            ]
+        };
+        assert_eq!(source_of(blocks(), &store), source_of(blocks(), &store));
     }
 }

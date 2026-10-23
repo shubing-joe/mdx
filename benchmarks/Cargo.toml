@@ -1,0 +1,35 @@
+# Standalone benchmark binary for the `mdx` render pipeline.
+#
+# This crate is deliberately *not* a member of the root workspace: it is listed
+# under `exclude` in `/Cargo.toml`, so `cargo build`/`cargo test` at the root
+# never builds it. It depends on the library crates only by path, uses no
+# external dependencies, and is never published.
+#
+# Run it with:
+#   CARGO_TARGET_DIR=target cargo run --release \
+#       --manifest-path benchmarks/Cargo.toml -- fixtures/notes/math.md
+[package]
+name = "mdx-bench"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[[bin]]
+name = "mdx-bench"
+path = "src/main.rs"
+
+[dependencies]
+mdx-core = { path = "../crates/mdx-core" }
+mdx-parse = { path = "../crates/mdx-parse" }
+mdx-assets = { path = "../crates/mdx-assets" }
+mdx-math = { path = "../crates/mdx-math" }
+mdx-diagram = { path = "../crates/mdx-diagram" }
+mdx-typst = { path = "../crates/mdx-typst" }
+
+# Mirrors the root workspace's release profile (`/Cargo.toml`) so the numbers
+# describe the same binary the workspace ships. Profiles live in the workspace
+# root; this package is its own root, so the stanza belongs here.
+[profile.release]
+lto = "thin"
+codegen-units = 1

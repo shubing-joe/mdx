@@ -14,11 +14,24 @@
 //!    trivial outer `\begin{equation}`-style environment.
 //! 2. **Reject** structurally broken LaTeX before it reaches the converter:
 //!    unbalanced `{`/`}`, mismatched `\begin`/`\end`, unbalanced
-//!    `\left`/`\right`. The third-party parser is a black box that may panic, so
-//!    it is additionally called behind a panic guard.
+//!    `\left`/`\right`, and a second script of the same kind on one base
+//!    (`x^2^3`). The third-party parser is a black box that may panic, so it is
+//!    additionally called behind a panic guard.
 //! 3. **Convert** with `tylax`.
 //! 4. **Extract** the math body from anything document-shaped the converter
-//!    emitted (`#math.equation(…)[…]`, directive lines, stray fences).
+//!    emitted (`#math.equation(…)[…]`, directive lines, stray fences), then
+//!    **verify** that body: an empty call argument (a mandatory LaTeX argument
+//!    the converter never received, `\frac{a}` → `frac(a,)`) and a control word
+//!    copied through verbatim instead of converted (`\nonexistentcommand{x}` →
+//!    `nonexistentcommandx`) are both rejected, because neither is a Typst
+//!    expression the author wrote. Neither check needs a command inventory: the
+//!    first reads the emitted call syntax, the second compares the body against
+//!    the input's own control words.
+//!
+//! The rejection set is the corpus contract: `crates/mdx-math/tests/coverage.rs`
+//! asserts that every valid fixture in `fixtures/math` converts and every
+//! `9xx-bad-*` fixture fails, and `fixtures/math/COVERAGE.md` records which
+//! constructs convert, which fall back to RaTeX, and which are known gaps.
 //!
 //! Errors are one line: a short reason plus the offending snippet, at most
 //! [`MAX_SNIPPET_CHARS`] characters of it.
@@ -60,10 +73,15 @@ const EMPTY_ARG_PLACEHOLDER: &str = "zws";
 ///
 /// * input that is empty once unwrapped,
 /// * unbalanced braces / mismatched environments / unbalanced `\left`…`\right`,
+/// * a second superscript or second subscript on one base (`x^2^3`, `x_1_2`),
 /// * an unescaped `$` left inside the expression (i.e. the caller passed more
 ///   than one expression),
-/// * a converter result that is not a math expression body, or that leaks the
-///   empty-argument placeholder `zws`.
+/// * a converter result that is not a math expression body, that leaks the
+///   empty-argument placeholder `zws`, or that contains an empty call argument
+///   (a mandatory LaTeX argument the converter never received, as in
+///   `\frac{a}`),
+/// * an undefined control sequence the converter would copy through verbatim
+///   rather than convert (`\nonexistentcommand{x}`).
 ///
 /// The reason quotes at most 80 characters of the offending input.
 ///
@@ -80,7 +98,14 @@ pub fn latex_to_typst(src: &str) -> Result<String, String> {
 
     let converted = convert_with_tylax(&body)?;
 
-    finalize_math(&converted)
+    let finished = finalize_math(&converted)?;
+
+    // The body is only trustworthy once it has been read back against the input
+    // it came from: the converter copies an unknown command through instead of
+    // failing on it, so the name surviving in the body is the only signal.
+    check_fused_control_word(&body, &finished)?;
+
+    Ok(finished)
 }
 
 // ---------------------------------------------------------------------------
@@ -164,13 +189,15 @@ fn strip_wrapper_environment(body: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Check the LaTeX structure the converter cannot be trusted with: braces,
-/// environment nesting and `\left`/`\right` pairs.
+/// environment nesting, `\left`/`\right` pairs and one script per kind per base.
 ///
 /// Positions in the error messages are character (not byte) offsets, and the
 /// quoted snippet is always a single line of at most [`MAX_SNIPPET_CHARS`]
 /// characters.
 fn check_structure(src: &str) -> Result<(), String> {
     let chars: Vec<char> = src.chars().collect();
+
+    check_script_duplication(&chars)?;
 
     let mut opened_at: Vec<usize> = Vec::new();
     let mut environments: Vec<(String, usize)> = Vec::new();
@@ -287,6 +314,117 @@ fn check_structure(src: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Reject a second superscript or subscript on one base.
+///
+/// TeX allows one of each per base, so `x^2_3` and `x_i^2` are fine while
+/// `x^2^3` and `x_1_2` are not. `tylax` accepts the duplicate silently and emits
+/// `x^(2)^(3)`, which is not a Typst expression at all — an author would see a
+/// formula that renders as its own source text instead of a reason. The
+/// duplicate is therefore rejected here, before the converter sees it.
+///
+/// A base ends at the next non-script atom, which is what makes
+/// `\sum_{i=0}^{n}`, `x^{2} y^3` and `x^{2}{}^3` all acceptable: each `^`/`_`
+/// belongs to a different base. Whitespace is skipped, brace groups (including
+/// nested ones) and a control word are consumed as the script's argument, and
+/// `%` comments are ignored exactly as in [`check_structure`].
+fn check_script_duplication(chars: &[char]) -> Result<(), String> {
+    let mut superscript_at: Option<usize> = None;
+    let mut subscript_at: Option<usize> = None;
+
+    let mut i = 0usize;
+    while i < chars.len() {
+        match chars[i] {
+            '%' => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '\\' => {
+                let (_, next) = read_command(chars, i);
+                i = next;
+                superscript_at = None;
+                subscript_at = None;
+            }
+            '^' | '_' => {
+                let is_superscript = chars[i] == '^';
+                let already = if is_superscript {
+                    superscript_at
+                } else {
+                    subscript_at
+                };
+
+                if let Some(at) = already {
+                    let what = if is_superscript {
+                        "superscript"
+                    } else {
+                        "subscript"
+                    };
+                    return Err(indict_at(
+                        &format!("double {what} on one base (TeX allows one)"),
+                        chars,
+                        at,
+                    ));
+                }
+
+                if is_superscript {
+                    superscript_at = Some(i);
+                } else {
+                    subscript_at = Some(i);
+                }
+
+                // The argument belongs to the script, so it must not end the
+                // base: `x^{2}^3` is a duplicate while `x^{2} y^3` is not.
+                i = script_argument_end(chars, i + 1);
+            }
+            c if c.is_whitespace() => i += 1,
+            _ => {
+                superscript_at = None;
+                subscript_at = None;
+                i += 1;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Index just past the argument of the script marker whose argument starts at
+/// `from`: a brace group (nested groups included), a control word, or the single
+/// character that follows. An unterminated group consumes the rest, leaving the
+/// brace check in [`check_structure`] to report it.
+fn script_argument_end(chars: &[char], from: usize) -> usize {
+    let mut i = from;
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+
+    if i >= chars.len() {
+        return i;
+    }
+
+    match chars[i] {
+        '{' => {
+            let mut depth = 0usize;
+            while i < chars.len() {
+                match chars[i] {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return i + 1;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            i
+        }
+        '\\' => read_command(chars, i).1,
+        _ => i + 1,
+    }
+}
+
 /// Read the command name starting at `chars[at]` (which must be `\`).
 ///
 /// Returns the name and the index just past it. A control *symbol* such as
@@ -401,6 +539,14 @@ fn finalize_math(converted: &str) -> Result<String, String> {
     if let Some(at) = find_placeholder(&chars) {
         return Err(indict_at(
             &format!("converter emitted the empty-argument placeholder `{EMPTY_ARG_PLACEHOLDER}`"),
+            &chars,
+            at,
+        ));
+    }
+
+    if let Some(at) = find_empty_argument(&chars) {
+        return Err(indict_at(
+            "converter emitted an empty argument (a mandatory LaTeX argument is missing)",
             &chars,
             at,
         ));
@@ -714,6 +860,191 @@ fn is_identifier_or_bracket(c: &char) -> bool {
     c.is_alphanumeric() || *c == '_' || *c == '[' || *c == ']' || *c == '"'
 }
 
+/// First empty argument of an emitted Typst call, with its character position.
+///
+/// A mandatory LaTeX argument that never arrives leaves an empty term in the
+/// emitted call: `\frac{a}` becomes `frac(a,)`, whose second argument does not
+/// exist, and `\sqrt` alone becomes `sqrt()`. Neither is a call the converter
+/// meant to write, so the body is rejected rather than passed on.
+///
+/// Only the first and the last term of a call are inspected. An empty *middle*
+/// term is legitimate: `a & & b` is a matrix row with an empty cell and becomes
+/// `mat(delim: #none, a,, b)`. String literals (`mat(delim: "[", …)`), `#text[…]`
+/// content blocks and `/* … */` comments are skipped, so punctuation inside
+/// them is never read as call syntax.
+fn find_empty_argument(chars: &[char]) -> Option<usize> {
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        match chars[i] {
+            '"' => i = skip_string(chars, i),
+            '[' => i = skip_balanced(chars, i, '[', ']'),
+            '/' if chars.get(i + 1) == Some(&'*') => i = skip_comment(chars, i),
+            '(' => {
+                let at = next_non_space(chars, i + 1);
+                if matches!(chars.get(at), Some(',') | Some(')')) {
+                    return Some(at);
+                }
+                i += 1;
+            }
+            ',' => {
+                let at = next_non_space(chars, i + 1);
+                if chars.get(at) == Some(&')') {
+                    return Some(at);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+
+    None
+}
+
+/// Index of the first non-whitespace character at or after `from`, or
+/// `chars.len()` when the rest of the body is whitespace.
+fn next_non_space(chars: &[char], from: usize) -> usize {
+    let mut i = from;
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// Index just past the `"…"` literal that starts at `open`.
+fn skip_string(chars: &[char], open: usize) -> usize {
+    let mut i = open + 1;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 2,
+            '"' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    chars.len()
+}
+
+/// Index just past the group `open`…`close` that starts at `open`, or
+/// `chars.len()` when it is unterminated.
+fn skip_balanced(chars: &[char], open: usize, opener: char, closer: char) -> usize {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < chars.len() {
+        if chars[i] == opener {
+            depth += 1;
+        } else if chars[i] == closer {
+            depth -= 1;
+            if depth == 0 {
+                return i + 1;
+            }
+        }
+        i += 1;
+    }
+    chars.len()
+}
+
+/// Index just past the `/* … */` comment that starts at `open`.
+fn skip_comment(chars: &[char], open: usize) -> usize {
+    let mut i = open + 2;
+    while i + 1 < chars.len() {
+        if chars[i] == '*' && chars[i + 1] == '/' {
+            return i + 2;
+        }
+        i += 1;
+    }
+    chars.len()
+}
+
+// ---------------------------------------------------------------------------
+// 5. Fidelity check
+// ---------------------------------------------------------------------------
+
+/// Shortest control word the copy-through check looks at.
+///
+/// A shorter name is too easy to confuse with the start of a longer identifier
+/// the converter legitimately emits: `\int{0}` would otherwise be read as the
+/// fused name `int` inside Typst's `integral`. Typos in one- to three-character
+/// commands therefore go unreported, which is the price of not carrying a
+/// command inventory.
+const MIN_COPIED_COMMAND_CHARS: usize = 4;
+
+/// Reject a control word the converter copied into the body instead of
+/// converting.
+///
+/// `tylax` does not fail on a command it does not know: it emits the command's
+/// own name as a Typst identifier and renders the braced argument beside it, so
+/// `\nonexistentcommand{x}` converts to the one identifier
+/// `nonexistentcommandx`. Nothing downstream can tell that apart from an
+/// author's own multi-letter identifier, so the body is checked against the
+/// control words of the input it came from: a name that survives in the body and
+/// runs straight on into another identifier character was copied, not converted.
+///
+/// Only a control word that is given a braced argument can fuse with it, so that
+/// is the trigger; a copied command with no group after it stays a separate
+/// token and is left alone. The comparison is textual and deliberately
+/// conservative: the reported snippet quotes the input's command.
+fn check_fused_control_word(src: &str, body: &str) -> Result<(), String> {
+    let body_chars: Vec<char> = body.chars().collect();
+    let chars: Vec<char> = src.chars().collect();
+
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] != '\\' {
+            i += 1;
+            continue;
+        }
+
+        let command_at = i;
+        let (name, next) = read_command(&chars, i);
+        i = next;
+
+        let is_named_command =
+            name.chars().all(|c| c.is_ascii_alphabetic()) && name.len() >= MIN_COPIED_COMMAND_CHARS;
+        // `\begin`/`\end` are handled by the environment path, never copied.
+        if !is_named_command || name == "begin" || name == "end" {
+            continue;
+        }
+
+        if chars.get(next_non_space(&chars, next)) != Some(&'{') {
+            continue;
+        }
+
+        if find_name_continuation(&body_chars, &name).is_some() {
+            return Err(indict_at(
+                &format!("undefined control sequence `\\{name}`: the converter copied it through"),
+                &chars,
+                command_at,
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Position in `body` where `name` starts an identifier that continues past it,
+/// i.e. where the copied name fused with what the converter emitted next.
+fn find_name_continuation(body: &[char], name: &str) -> Option<usize> {
+    let needle: Vec<char> = name.chars().collect();
+
+    let mut i = 0usize;
+    while i + needle.len() < body.len() {
+        if body[i..i + needle.len()] == needle[..] {
+            let before = i.checked_sub(1).and_then(|j| body.get(j));
+            let after = body.get(i + needle.len());
+
+            if !before.is_some_and(is_identifier_or_bracket)
+                && after.is_some_and(|c| c.is_alphanumeric())
+            {
+                return Some(i);
+            }
+        }
+
+        i += 1;
+    }
+
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Error messages
 // ---------------------------------------------------------------------------
@@ -914,6 +1245,96 @@ mod tests {
                 "expected an error for {src:?}"
             );
         }
+    }
+
+    /// `x^2^3` is not TeX, and the converter would otherwise emit the unusable
+    /// Typst body `x^(2)^(3)` for it.
+    #[test]
+    fn rejects_double_scripts() -> Result<(), String> {
+        let cases = [
+            (r"x^2^3", "double superscript"),
+            (r"x_1_2", "double subscript"),
+            (r"\sum_{i=0}^{n}^{2}", "double superscript"),
+        ];
+
+        for (src, expected) in cases {
+            match latex_to_typst(src) {
+                Ok(body) => {
+                    return Err(format!("expected an error for {src:?}, got `{body}`"));
+                }
+                Err(reason) => assert!(
+                    reason.contains(expected),
+                    "reason {reason:?} does not mention {expected:?}"
+                ),
+            }
+        }
+
+        // One script of each kind per base is ordinary LaTeX and must survive,
+        // as must a second base after a script (`x^{2} y^3`).
+        for src in [r"x^2_3", r"x_i^2", r"\sum_{i=0}^{n}", r"x^{2} y^3"] {
+            let body = latex_to_typst(src)?;
+            assert!(!body.is_empty(), "{src:?} converted to an empty body");
+        }
+
+        Ok(())
+    }
+
+    /// A mandatory argument that never arrives leaves an empty term in the
+    /// emitted call (`\frac{a}` → `frac(a,)`), which is not an expression the
+    /// author wrote.
+    #[test]
+    fn rejects_missing_mandatory_arguments() -> Result<(), String> {
+        for src in [r"\frac{a}", r"\sqrt"] {
+            match latex_to_typst(src) {
+                Ok(body) => {
+                    return Err(format!("expected an error for {src:?}, got `{body}`"));
+                }
+                Err(reason) => assert!(
+                    reason.contains("empty argument"),
+                    "unexpected reason for {src:?}: {reason}"
+                ),
+            }
+        }
+
+        // An empty *middle* term is a legitimate empty table cell, not a
+        // missing argument: `a & & b` becomes `mat(delim: #none, a,, b)`.
+        assert!(latex_to_typst(r"\begin{matrix} a & & b \end{matrix}").is_ok());
+
+        Ok(())
+    }
+
+    /// The converter copies a command it does not know through as a bare
+    /// identifier, which fuses with the group that follows it.
+    #[test]
+    fn rejects_copied_control_words() -> Result<(), String> {
+        match latex_to_typst(r"\nonexistentcommand{x}") {
+            Ok(body) => {
+                return Err(format!("expected an error, got `{body}`"));
+            }
+            Err(reason) => assert!(
+                reason.contains("undefined control sequence")
+                    && reason.contains("nonexistentcommand"),
+                "unexpected reason: {reason}"
+            ),
+        }
+
+        // The same command with no group after it cannot be told apart from a
+        // multi-letter identifier, so it is not reported.
+        assert!(latex_to_typst(r"\nonexistentcommand + y").is_ok());
+
+        // Commands the converter does know must keep converting, including the
+        // ones it renders as a call whose name is not the LaTeX name.
+        for src in [
+            r"\operatorname{sgn}(x)",
+            r"\mathbb{R}",
+            r"\text{hello}",
+            r"\begin{matrix} a & b \\ c & d \end{matrix}",
+        ] {
+            let body = latex_to_typst(src)?;
+            assert!(!body.is_empty(), "{src:?} converted to an empty body");
+        }
+
+        Ok(())
     }
 
     #[test]

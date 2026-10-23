@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="mdx">
+  <!-- Placeholder application icon: a document sheet on a rounded tile. Text
+       glyphs are drawn as primitives so the file needs no font. -->
+  <rect width="256" height="256" rx="56" fill="#1f2430"/>
+  <path d="M72 40h80l40 40v136H72z" fill="#f2f4f8"/>
+  <path d="M152 40l40 40h-40z" fill="#c8ced9"/>
+  <rect x="96" y="104" width="72" height="14" rx="7" fill="#1f2430"/>
+  <rect x="96" y="136" width="72" height="14" rx="7" fill="#1f2430"/>
+  <rect x="96" y="168" width="44" height="14" rx="7" fill="#1f2430"/>
+</svg>

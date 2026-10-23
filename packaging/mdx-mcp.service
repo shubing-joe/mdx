@@ -1,0 +1,44 @@
+[Unit]
+Description=mdx MCP server (stdio)
+Documentation=https://github.com/shubing-joe/mdx
+# NOTE — stdio transport.
+#
+# `mdx-mcp` speaks the Model Context Protocol over *standard input and standard
+# output*: it reads JSON-RPC frames from stdin, writes them to stdout, and exits
+# when that transport closes. It has no socket, no port and no daemon mode, and
+# it is normally spawned — with its pipes owned — by the MCP client: an editor or
+# an agent, configured as in the "MCP server" section of the repository README.
+# That client configuration is the supported way to run the server.
+#
+# This unit is the starting point for the cases where a service manager still has
+# to own the process, for example to keep one instance per document tree with its
+# streams bridged to something else. Copy it into
+# `~/.config/systemd/user/mdx-mcp.service` and override the streams there, for
+# example:
+#
+#   [Service]
+#   StandardInput=socket
+#   StandardOutput=socket
+#
+# The defaults below give the server no client: it starts, reads end of input and
+# exits with status 0 immediately. That is the correct behaviour for a stdio
+# server with nothing attached, not a failure, which is why `Restart=no` is set
+# rather than a restart loop.
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/mdx-mcp
+WorkingDirectory=%h
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+Restart=no
+NoNewPrivileges=yes
+PrivateTmp=yes
+# The server reads documents and writes PDF/HTML files beside them, so the whole
+# hierarchy stays writable (`strict` would also affect the directories a document
+# is rendered into).
+ProtectSystem=full
+
+[Install]
+WantedBy=default.target

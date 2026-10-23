@@ -2,8 +2,11 @@
 //!
 //! The SVG exporter in `mdx-typst` emits one standalone SVG document per page.
 //! This module draws such a page list as a scrollable column of images inside an
-//! [`egui::Ui`], with page numbers and a choice between "fit width" and an
-//! explicit zoom factor.
+//! [`egui::Ui`], behind a toolbar that carries every navigation control the pane
+//! has: the "Fit width" toggle, the zoom preset buttons (50 / 100 / 150 / 200 %)
+//! next to the free-form zoom drag value, a "Go to page" number field with its
+//! "Go" button, and the `Page N / M` counter that tracks the page at the top of
+//! the viewport.
 //!
 //! Every page is handed to egui as a `data:image/svg+xml;base64,…` data URI.
 //! [`SvgDataUriLoader`] — registered lazily, on the first call to [`show`] — is
@@ -13,12 +16,13 @@
 //! clock.
 //!
 //! All state lives either in the caller's values (`pages`, `zoom`) or in egui's
-//! temporary memory (the fit-width toggle and the per-page cached data URIs).
+//! temporary memory (the fit-width toggle, the page navigation and the per-page
+//! cached data URIs).
 
 use std::sync::Arc;
 
 use egui::load::{ImageLoadResult, ImageLoader, LoadError, SizeHint};
-use egui::{Color32, CornerRadius, Id, Margin, RichText, Ui, Vec2, vec2};
+use egui::{Align, Color32, CornerRadius, Id, Margin, Rect, RichText, Ui, Vec2, vec2};
 
 /// Smallest zoom factor the pane accepts.
 pub const MIN_ZOOM: f32 = 0.25;
@@ -26,8 +30,12 @@ pub const MIN_ZOOM: f32 = 0.25;
 /// Largest zoom factor the pane accepts.
 pub const MAX_ZOOM: f32 = 4.0;
 
-/// Zoom factor restored by the pane's "100 %" button.
+/// Zoom factor of the pane's "100 %" preset, and the value every non-finite
+/// zoom falls back to.
 pub const DEFAULT_ZOOM: f32 = 1.0;
+
+/// Zoom factors offered as one-click buttons in the toolbar.
+const ZOOM_PRESETS: [f32; 4] = [0.5, DEFAULT_ZOOM, 1.5, 2.0];
 
 /// Media-type prefix of the data URI used for every page.
 const DATA_URI_PREFIX: &str = "data:image/svg+xml;base64,";
@@ -42,29 +50,61 @@ const PAGE_GAP: f32 = 16.0;
 /// factor, so dragging the zoom control does not re-rasterize on every step.
 const RASTER_HYSTERESIS: f32 = 1.25;
 
+/// Page navigation state, kept in egui's temporary memory.
+///
+/// `current` is the page at the top of the viewport and drives the toolbar's
+/// counter (it is only known after a frame has been drawn, so the counter lags
+/// scrolling by one frame). `jump` is the one-based value of the toolbar's "Go
+/// to page" field, and `pending` records that the user asked for a jump that the
+/// next drawn page list must scroll to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PageNav {
+    current: usize,
+    jump: usize,
+    pending: bool,
+}
+
+impl Default for PageNav {
+    fn default() -> Self {
+        Self {
+            current: 0,
+            jump: 1,
+            pending: false,
+        }
+    }
+}
+
 /// Draw the preview pane.
 ///
 /// `pages` holds one standalone SVG document per page, in document order (as
 /// produced by `mdx-typst`'s SVG exporter). `zoom` is the pane's persistent zoom
 /// factor: it is clamped into [`MIN_ZOOM`]`..=`[`MAX_ZOOM`] and written back when
-/// the user drags the zoom control. Whether pages are scaled to the pane width
-/// instead is kept in egui's temporary memory and defaults to "fit width".
+/// the user drags the zoom control or clicks a preset. Whether pages are scaled
+/// to the pane width instead, the page the counter tracks and a pending "Go to
+/// page" request are all kept in egui's temporary memory; fit-width defaults to
+/// on.
 ///
-/// An empty `pages` slice draws a placeholder instead of the page list.
+/// An empty `pages` slice draws a placeholder instead of the toolbar and the
+/// page list.
 pub fn show(ui: &mut Ui, pages: &[String], zoom: &mut f32) {
     *zoom = normalize_zoom(*zoom);
 
-    if pages.is_empty() {
+    let total = pages.len();
+    if total == 0 {
         placeholder(ui);
         return;
     }
 
     ensure_loader(ui.ctx());
 
+    let mut nav = nav_state(ui.ctx());
+    nav.jump = normalize_jump(nav.jump, total);
+    nav.current = nav.current.min(total - 1);
+
     let mut fit_width = fit_width_enabled(ui.ctx());
     let pane_width = ui.available_width();
 
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.checkbox(&mut fit_width, "Fit width");
         ui.add_enabled_ui(!fit_width, |ui| {
             ui.add(
@@ -75,41 +115,88 @@ pub fn show(ui: &mut Ui, pages: &[String], zoom: &mut f32) {
                     .suffix("x"),
             );
         });
-        if ui.button("100 %").clicked() {
-            *zoom = DEFAULT_ZOOM;
+
+        // Picking a preset is an explicit request for that zoom level, so it
+        // leaves "Fit width" mode; otherwise the click would do nothing.
+        for preset in ZOOM_PRESETS {
+            let selected = !fit_width && is_preset(*zoom, preset);
+            if ui
+                .selectable_label(selected, percent_label(preset))
+                .clicked()
+            {
+                *zoom = preset;
+                fit_width = false;
+            }
         }
+
         if let Some(scale) = pages
             .first()
             .and_then(|svg| display_scale(svg_intrinsic_size(svg), pane_width, fit_width, *zoom))
         {
-            ui.label(
-                RichText::new(format!("{:.0} %", scale * 100.0))
-                    .weak()
-                    .monospace(),
-            );
+            ui.label(RichText::new(percent_label(scale)).weak().monospace());
         }
+
         ui.separator();
-        ui.label(RichText::new(page_count_label(pages.len())).weak());
+        ui.label("Go to page");
+        ui.add(
+            egui::DragValue::new(&mut nav.jump)
+                .speed(0.5)
+                .range(1..=total),
+        );
+        if ui
+            .button("Go")
+            .on_hover_text("Scroll the preview to that page")
+            .clicked()
+        {
+            nav.pending = true;
+        }
+
+        ui.separator();
+        ui.label(
+            RichText::new(page_label(nav.current, total))
+                .weak()
+                .monospace(),
+        );
     });
 
     set_fit_width(ui.ctx(), fit_width);
     ui.separator();
 
     let effective_zoom = normalize_zoom(*zoom);
+    let target = page_index(nav.jump, total);
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            let viewport_top = ui.clip_rect().top();
             for (index, svg) in pages.iter().enumerate() {
-                draw_page(ui, index, pages.len(), svg, effective_zoom, fit_width);
-                if index + 1 < pages.len() {
+                let rect = draw_page(ui, index, total, svg, effective_zoom, fit_width);
+                nav.current = top_page(viewport_top, nav.current, index, rect.top());
+                if nav.pending && target == Some(index) {
+                    ui.scroll_to_rect(rect, Some(Align::TOP));
+                    nav.current = index;
+                    nav.pending = false;
+                }
+                if index + 1 < total {
                     ui.add_space(PAGE_GAP);
                 }
             }
         });
+
+    set_nav_state(ui.ctx(), nav);
 }
 
 /// Draw one page: its header line and the rasterized page itself.
-fn draw_page(ui: &mut Ui, index: usize, total: usize, svg: &str, zoom: f32, fit_width: bool) {
+///
+/// Returns the page's outer rectangle, which the caller uses to tell which page
+/// the viewport is showing and where a requested jump has to scroll to.
+fn draw_page(
+    ui: &mut Ui,
+    index: usize,
+    total: usize,
+    svg: &str,
+    zoom: f32,
+    fit_width: bool,
+) -> Rect {
     let intrinsic = svg_intrinsic_size(svg);
     let scale = display_scale(intrinsic, ui.available_width(), fit_width, zoom);
     let display = intrinsic
@@ -126,11 +213,7 @@ fn draw_page(ui: &mut Ui, index: usize, total: usize, svg: &str, zoom: f32, fit_
             );
         }
         if let Some(scale) = scale {
-            ui.label(
-                RichText::new(format!("{:.0} %", scale * 100.0))
-                    .weak()
-                    .monospace(),
-            );
+            ui.label(RichText::new(percent_label(scale)).weak().monospace());
         }
     });
 
@@ -158,7 +241,9 @@ fn draw_page(ui: &mut Ui, index: usize, total: usize, svg: &str, zoom: f32, fit_
         .inner_margin(Margin::same(1))
         .show(ui, |ui| {
             ui.add(image);
-        });
+        })
+        .response
+        .rect
 }
 
 /// Caps a page's on-screen size so its rasterized texture stays inside the
@@ -184,9 +269,13 @@ fn clamp_to_texture(ctx: &egui::Context, size: Vec2) -> Vec2 {
 fn placeholder(ui: &mut Ui) {
     ui.add_space(PAGE_GAP);
     ui.vertical_centered(|ui| {
-        ui.label(RichText::new("No pages to preview").size(16.0).strong());
         ui.label(
-            RichText::new("Render the document, or check the diagnostics for the reason.").weak(),
+            RichText::new("No pages yet — press Ctrl+R")
+                .size(16.0)
+                .strong(),
+        );
+        ui.label(
+            RichText::new("Rendered pages appear here; failures show up in Diagnostics.").weak(),
         );
     });
 }
@@ -196,13 +285,62 @@ fn page_label(index: usize, total: usize) -> String {
     format!("Page {} / {total}", index + 1)
 }
 
-/// `1 page` / `7 pages`.
-fn page_count_label(total: usize) -> String {
-    if total == 1 {
-        "1 page".to_owned()
+/// The percentage a zoom factor or a preset is labelled with, e.g. `50 %`.
+fn percent_label(scale: f32) -> String {
+    if scale.is_finite() {
+        format!("{:.0} %", scale * 100.0)
     } else {
-        format!("{total} pages")
+        "n/a".to_owned()
     }
+}
+
+/// Whether `zoom` sits on `preset`, within the slack the buttons are drawn with.
+fn is_preset(zoom: f32, preset: f32) -> bool {
+    (zoom - preset).abs() < 1e-3
+}
+
+/// Clamp a one-based page number into `1..=total`.
+///
+/// An empty page list still yields `1`: the "Go to page" field then shows the
+/// first page, which is what an empty document has.
+fn normalize_jump(jump: usize, total: usize) -> usize {
+    jump.clamp(1, total.max(1))
+}
+
+/// Zero-based index a one-based page number selects, or `None` without pages.
+fn page_index(jump: usize, total: usize) -> Option<usize> {
+    if total == 0 {
+        return None;
+    }
+    Some(normalize_jump(jump, total) - 1)
+}
+
+/// Index of the page shown at the top of the viewport.
+///
+/// Pages are drawn in document order, so the counter keeps taking the newest
+/// page that starts at or above the viewport's top edge; a page starting below
+/// it leaves the counter alone. Non-finite geometry never moves the counter.
+fn top_page(viewport_top: f32, previous: usize, index: usize, page_top: f32) -> usize {
+    if viewport_top.is_finite() && page_top.is_finite() && page_top <= viewport_top + 1.0 {
+        index
+    } else {
+        previous
+    }
+}
+
+/// Page navigation state remembered by the pane.
+fn nav_state(ctx: &egui::Context) -> PageNav {
+    ctx.data(|data| data.get_temp::<PageNav>(nav_id()).unwrap_or_default())
+}
+
+/// Remember the page navigation state for the next frame.
+fn set_nav_state(ctx: &egui::Context, nav: PageNav) {
+    ctx.data_mut(|data| data.insert_temp(nav_id(), nav));
+}
+
+/// Id of the temporary page navigation state.
+fn nav_id() -> Id {
+    Id::unique("mdx-gui::preview::page-nav")
 }
 
 /// Clamp `zoom` into the supported range, replacing non-finite values.
@@ -749,8 +887,145 @@ mod tests {
     fn page_labels_are_one_based() {
         assert_eq!(page_label(0, 7), "Page 1 / 7");
         assert_eq!(page_label(6, 7), "Page 7 / 7");
-        assert_eq!(page_count_label(1), "1 page");
-        assert_eq!(page_count_label(3), "3 pages");
+    }
+
+    #[test]
+    fn zoom_presets_are_labelled_as_percentages() {
+        assert_eq!(percent_label(ZOOM_PRESETS[0]), "50 %");
+        assert_eq!(percent_label(ZOOM_PRESETS[1]), "100 %");
+        assert_eq!(percent_label(ZOOM_PRESETS[2]), "150 %");
+        assert_eq!(percent_label(ZOOM_PRESETS[3]), "200 %");
+        assert_eq!(percent_label(f32::NAN), "n/a");
+    }
+
+    #[test]
+    fn preset_buttons_recognise_their_own_zoom() {
+        for preset in ZOOM_PRESETS {
+            assert!(is_preset(preset, preset));
+        }
+        assert!(is_preset(ZOOM_PRESETS[2] + 1e-6, ZOOM_PRESETS[2]));
+        assert!(!is_preset(DEFAULT_ZOOM, ZOOM_PRESETS[2]));
+        assert!(!is_preset(f32::NAN, DEFAULT_ZOOM));
+    }
+
+    #[test]
+    fn page_numbers_are_clamped_to_the_page_list() {
+        assert_eq!(normalize_jump(0, 7), 1);
+        assert_eq!(normalize_jump(3, 7), 3);
+        assert_eq!(normalize_jump(99, 7), 7);
+        assert_eq!(normalize_jump(0, 0), 1);
+
+        assert_eq!(page_index(1, 7), Some(0));
+        assert_eq!(page_index(7, 7), Some(6));
+        assert_eq!(page_index(99, 7), Some(6));
+        assert_eq!(page_index(1, 0), None);
+    }
+
+    #[test]
+    fn the_counter_follows_the_topmost_visible_page() {
+        // Page 0 starts at the viewport's top edge.
+        let current = top_page(0.0, 0, 0, 0.0);
+        assert_eq!(current, 0);
+
+        // Page 1 starts far below the viewport: the counter stays on page 0.
+        let current = top_page(0.0, current, 1, 900.0);
+        assert_eq!(current, 0);
+
+        // Scrolled past page 1's top edge.
+        let current = top_page(950.0, current, 1, 900.0);
+        assert_eq!(current, 1);
+
+        // Unusable geometry never moves the counter.
+        assert_eq!(top_page(f32::NAN, current, 2, 1800.0), 1);
+        assert_eq!(top_page(1900.0, current, 2, f32::NAN), 1);
+    }
+
+    #[test]
+    fn navigation_state_defaults_to_the_first_page() {
+        let nav = PageNav::default();
+        assert_eq!(nav.current, 0);
+        assert_eq!(nav.jump, 1);
+        assert!(!nav.pending);
+
+        let ctx = egui::Context::default();
+        assert_eq!(nav_state(&ctx), PageNav::default());
+        set_nav_state(
+            &ctx,
+            PageNav {
+                current: 4,
+                jump: 5,
+                pending: true,
+            },
+        );
+        assert_eq!(
+            nav_state(&ctx),
+            PageNav {
+                current: 4,
+                jump: 5,
+                pending: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_pending_jump_scrolls_the_list_and_moves_the_counter() {
+        let pages = vec![PAGE_SVG.to_owned(); 4];
+        let mut zoom: f32 = DEFAULT_ZOOM;
+
+        egui::__run_test_ui(|ui| {
+            set_nav_state(
+                ui.ctx(),
+                PageNav {
+                    current: 0,
+                    jump: 3,
+                    pending: true,
+                },
+            );
+            show(ui, &pages, &mut zoom);
+
+            let nav = nav_state(ui.ctx());
+            assert_eq!(nav.current, 2);
+            assert!(!nav.pending);
+            assert_eq!(nav.jump, 3);
+        });
+    }
+
+    #[test]
+    fn a_jump_beyond_the_last_page_is_clamped_every_frame() {
+        let pages = vec![PAGE_SVG.to_owned(); 2];
+        let mut zoom: f32 = DEFAULT_ZOOM;
+
+        egui::__run_test_ui(|ui| {
+            set_nav_state(
+                ui.ctx(),
+                PageNav {
+                    current: 9,
+                    jump: 99,
+                    pending: true,
+                },
+            );
+            show(ui, &pages, &mut zoom);
+
+            let nav = nav_state(ui.ctx());
+            assert_eq!(nav.jump, 2);
+            assert_eq!(nav.current, 1);
+            assert!(!nav.pending);
+        });
+    }
+
+    #[test]
+    fn an_empty_page_list_only_normalises_the_zoom() {
+        let mut zoom: f32 = f32::NAN;
+        egui::__run_test_ui(|ui| {
+            show(ui, &[], &mut zoom);
+        });
+        assert!(approx(zoom, DEFAULT_ZOOM));
+
+        let mut huge: f32 = 100.0;
+        egui::__run_test_ui(|ui| {
+            show(ui, &[], &mut huge);
+        });
+        assert!(approx(huge, MAX_ZOOM));
     }
 
     #[test]

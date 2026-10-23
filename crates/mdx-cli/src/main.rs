@@ -1,36 +1,44 @@
 //! `mdx` — command line front end of the `mdx` Markdown toolchain.
 //!
-//! Four subcommands sit on one pipeline (see [`pipeline`]):
+//! Six subcommands sit on one pipeline (see [`pipeline`]):
 //!
 //! * `render` writes a PDF or a self-contained HTML document,
 //! * `check` parses a document and resolves its assets without writing output,
 //! * `ast` prints the parsed document model as JSON,
-//! * `assets` resolves assets and prints the asset manifest.
+//! * `assets` resolves assets and prints the asset manifest,
+//! * `outline` prints the heading tree of a document,
+//! * `watch` repeats the `render` build whenever the input file changes.
 //!
 //! Exit codes come from `mdx-core`: `0` success, `1` parse/render failure,
 //! `2` usage or config error, `3` unresolved assets. `--json` replaces stdout
 //! with a single object `{"ok","exit","diagnostics","output","manifest"}`
 //! (`"ast"` is added by `mdx ast`); without it, diagnostics go to stderr as
 //! `CODE: message` and the command's result — written path, document model or
-//! manifest — goes to stdout.
+//! manifest — goes to stdout. `mdx outline --json` prints its array instead of
+//! that envelope, and `mdx watch` prints one status line per build,
+//! `built <path> in <ms> ms` or `error <CODE>: <message>`.
 
 mod pipeline;
+mod watch;
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use mdx_core::{DiagCode, Diagnostic, Doc, Report};
+use mdx_core::{DiagCode, Diagnostic, Doc, Report, Severity, TocEntry};
 use serde::Serialize;
 
 fn main() {
     let cli = Cli::parse();
-    let outcome = match cli.command {
-        Command::Render(args) => render(args),
-        Command::Check(args) => check(args),
-        Command::Ast(args) => ast(args),
-        Command::Assets(args) => assets(args),
+    let exit = match cli.command {
+        Command::Render(args) => render(args).finish(),
+        Command::Check(args) => check(args).finish(),
+        Command::Ast(args) => ast(args).finish(),
+        Command::Assets(args) => assets(args).finish(),
+        Command::Outline(args) => outline(args),
+        Command::Watch(args) => watch_command(args),
     };
-    std::process::exit(outcome.finish());
+    std::process::exit(exit);
 }
 
 /// `mdx` command line interface.
@@ -40,14 +48,16 @@ fn main() {
     version,
     about = "Render Markdown documents to PDF or HTML",
     long_about = "Converts a Markdown document to a PDF (Typst) or self-contained HTML, \
-                  resolving images, LaTeX math and Mermaid diagrams on the way."
+                  resolving images, LaTeX math and Mermaid diagrams on the way. \
+                  `mdx watch` repeats that build whenever the input file changes, \
+                  `mdx outline` prints the heading tree."
 )]
 struct Cli {
     #[command(subcommand)]
     command: Command,
 }
 
-/// The four operations `mdx` offers.
+/// The six operations `mdx` offers.
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Render a document to PDF or HTML.
@@ -58,15 +68,18 @@ enum Command {
     Ast(DocumentArgs),
     /// Resolve assets and print the asset manifest as JSON.
     Assets(DocumentArgs),
+    /// Print the document's table of contents.
+    Outline(OutlineArgs),
+    /// Rebuild a document whenever its file changes.
+    Watch(WatchArgs),
 }
 
-/// Arguments of `mdx render`.
+/// Build flags shared by `mdx render` and `mdx watch`.
+///
+/// `mdx watch` accepts every one of them so a watched build is exactly the
+/// build `mdx render` would produce; the defaults are the same, too.
 #[derive(Debug, Args)]
-struct RenderArgs {
-    /// Markdown document to render.
-    #[arg(value_name = "INPUT")]
-    input: PathBuf,
-
+struct BuildArgs {
     /// Where to write the result (default: the input path with the new extension).
     #[arg(short = 'o', long = "out", value_name = "OUT")]
     out: Option<PathBuf>,
@@ -115,10 +128,56 @@ struct RenderArgs {
     /// Write the generated Typst markup to this path (debugging aid).
     #[arg(long = "dump-typst", value_name = "PATH")]
     dump_typst: Option<PathBuf>,
+}
+
+/// Arguments of `mdx render`.
+#[derive(Debug, Args)]
+struct RenderArgs {
+    /// Markdown document to render.
+    #[arg(value_name = "INPUT")]
+    input: PathBuf,
+
+    #[command(flatten)]
+    build: BuildArgs,
 
     /// Print one machine-readable JSON object instead of the default output.
     #[arg(long)]
     json: bool,
+}
+
+/// Arguments of `mdx outline`.
+#[derive(Debug, Args)]
+struct OutlineArgs {
+    /// Markdown document to outline.
+    #[arg(value_name = "INPUT")]
+    input: PathBuf,
+
+    /// Print the table of contents as a JSON array instead of an indented tree.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Arguments of `mdx watch`.
+#[derive(Debug, Args)]
+struct WatchArgs {
+    /// Markdown document to watch.
+    #[arg(value_name = "INPUT")]
+    input: PathBuf,
+
+    #[command(flatten)]
+    build: BuildArgs,
+
+    /// Milliseconds the input has to stay unchanged before a rebuild starts.
+    #[arg(
+        long = "debounce-ms",
+        value_name = "N",
+        default_value_t = watch::DEFAULT_DEBOUNCE_MS
+    )]
+    debounce_ms: u64,
+
+    /// Build once and exit instead of watching the file.
+    #[arg(long)]
+    once: bool,
 }
 
 /// Arguments shared by `mdx check`, `mdx ast` and `mdx assets`.
@@ -224,29 +283,24 @@ impl PdfStandardArg {
 
 /// Render one document to PDF or HTML.
 fn render(args: RenderArgs) -> Outcome {
-    let RenderArgs {
-        input,
-        out,
-        format,
-        toc,
-        paper,
-        pdf_standard,
-        fonts,
-        ignore_system_fonts,
-        offline,
-        deterministic,
-        jobs,
-        dump_typst,
-        json,
-    } = args;
+    let RenderArgs { input, build, json } = args;
+    build_document(&build, &input, json)
+}
 
+/// Build one document — read, resolve, render, write — reporting nothing.
+///
+/// `mdx render` prints the returned [`Outcome`]; `mdx watch` consumes it and
+/// reports one status line per rebuild. Both go through here, so a watched
+/// build cannot drift from the build `mdx render` performs. The output path is
+/// [`default_output`] unless `-o` overrode it.
+fn build_document(args: &BuildArgs, input: &Path, json: bool) -> Outcome {
     if !input.exists() {
         return Outcome::usage(
             json,
             format!("input file {} does not exist", input.display()),
         );
     }
-    let loaded = match pipeline::load(&input, &pipeline::asset_policy(offline)) {
+    let loaded = match pipeline::load(input, &pipeline::asset_policy(args.offline)) {
         Ok(loaded) => loaded,
         Err(diagnostic) => return Outcome::error(json, diagnostic),
     };
@@ -269,35 +323,45 @@ fn render(args: RenderArgs) -> Outcome {
         );
     }
 
-    pipeline::note_missing_fonts(&fonts, &mut report);
-    let math = pipeline::math_map(&doc, jobs, &mut report);
+    let format = args.format;
+    pipeline::note_missing_fonts(&args.fonts, &mut report);
+    let math = pipeline::math_map(&doc, args.jobs, &mut report);
     let diagram_options = mdx_diagram::DiagramOptions {
-        deterministic_text: deterministic,
-        font_files: fonts.clone(),
+        deterministic_text: args.deterministic,
+        font_files: args.fonts.clone(),
     };
-    let diagrams = pipeline::diagram_map(&doc, jobs, &diagram_options, &mut report);
-    let path = match out {
-        Some(path) => path,
-        None => default_output(&input, format),
+    let diagrams = pipeline::diagram_map(&doc, args.jobs, &diagram_options, &mut report);
+    // PDF/A and PDF/UA require a document title; fall back to the file stem so
+    // `--pdf-standard ua-1` works on documents without front matter.
+    let document_title = doc.front.title.clone().or_else(|| {
+        input
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_owned)
+    });
+    let path = match &args.out {
+        Some(path) => path.clone(),
+        None => default_output(input, format),
     };
 
     let written = match format {
         Format::Pdf => {
             let options = mdx_typst::RenderOptions {
                 page: mdx_typst::PageSetup {
-                    paper: paper.to_typst(),
+                    paper: args.paper.to_typst(),
                     margin_mm: pipeline::DEFAULT_MARGIN_MM,
                     numbered: true,
                 },
-                toc,
-                pdf_standard: pdf_standard.map(PdfStandardArg::to_typst),
-                fonts,
-                ignore_system_fonts,
-                deterministic_today: deterministic
+                toc: args.toc,
+                pdf_standard: args.pdf_standard.map(PdfStandardArg::to_typst),
+                fonts: args.fonts.clone(),
+                ignore_system_fonts: args.ignore_system_fonts,
+                deterministic_today: args
+                    .deterministic
                     .then(|| pipeline::DETERMINISTIC_TODAY.to_string()),
-                title: doc.front.title.clone(),
+                title: document_title.clone(),
             };
-            if let Some(path) = dump_typst.as_deref() {
+            if let Some(path) = args.dump_typst.as_deref() {
                 let source = mdx_typst::writer::build(&doc, &assets, &math, &diagrams, &options);
                 if let Err(error) = std::fs::write(path, source) {
                     report.push(mdx_core::Diagnostic::error(
@@ -314,7 +378,7 @@ fn render(args: RenderArgs) -> Outcome {
             let options = mdx_html::HtmlOptions {
                 embed_assets: true,
                 css: None,
-                title: doc.front.title.clone(),
+                title: document_title.clone(),
             };
             pipeline::render_html(&doc, &assets, &math, &diagrams, &options, &mut report)
                 .map(|html| pipeline::write_output(&path, html.as_bytes()))
@@ -416,6 +480,152 @@ fn assets(args: DocumentArgs) -> Outcome {
         Some(assets.to_json()),
         None,
     )
+}
+
+/// Print the document's table of contents.
+///
+/// The text form is an indented tree — two spaces per heading level below the
+/// first — and `--json` prints the bare `[{level,id,title}]` array, because an
+/// array is what a script wants to read. Diagnostics go to stderr in both
+/// forms, and the exit code reports them either way: an outline is still
+/// printable for a document that does not build, so it is not withheld. The
+/// entries come from the parser alone, as in `mdx ast`; asset resolution cannot
+/// add or remove a heading.
+fn outline(args: OutlineArgs) -> i32 {
+    let OutlineArgs { input, json } = args;
+
+    // A failure here has no array form, so it uses the ordinary non-JSON
+    // reporting: `E_IO` on stderr and the usage exit code.
+    if !input.exists() {
+        let message = format!("input file {} does not exist", input.display());
+        return Outcome::usage(false, message).finish();
+    }
+    let source = match pipeline::read_source(&input) {
+        Ok(source) => source,
+        Err(diagnostic) => return Outcome::error(false, diagnostic).finish(),
+    };
+    let (doc, report) = pipeline::parse_document(&source, &input);
+
+    for diagnostic in &report.diagnostics {
+        print_diagnostic(diagnostic);
+    }
+    if json {
+        print_json(&doc.toc);
+    } else {
+        for entry in &doc.toc {
+            println!("{}", outline_line(entry));
+        }
+    }
+    mdx_core::exit_code(&report)
+}
+
+/// One line of the indented outline: `title (id)`, two spaces per level.
+fn outline_line(entry: &TocEntry) -> String {
+    let mut line = String::with_capacity(entry.title.len() + entry.id.len() + 6);
+    for _ in 1..entry.level {
+        line.push_str("  ");
+    }
+    line.push_str(&entry.title);
+    line.push_str(" (");
+    line.push_str(&entry.id);
+    line.push(')');
+    line
+}
+
+/// Watch one document and rebuild it whenever the file changes.
+///
+/// The loop polls the input's modification time every [`watch::TICK`] and
+/// builds once the change has been quiet for `--debounce-ms` (400 ms by
+/// default), so a save that arrives as several writes still produces one build.
+/// The first build starts as soon as the input can be read. stdout carries
+/// exactly one line per build — `built <path> in <ms> ms` or
+/// `error <CODE>: <message>` — while warnings keep their position information
+/// on stderr. An input that cannot be read is reported once and the loop keeps
+/// polling for it to come back; only Ctrl-C ends the process (default signal
+/// handling), and `--once` returns the exit code of its single build.
+fn watch_command(args: WatchArgs) -> i32 {
+    let WatchArgs {
+        input,
+        build,
+        debounce_ms,
+        once,
+    } = args;
+
+    let output = match build.out.as_deref() {
+        Some(path) => path.to_path_buf(),
+        None => default_output(&input, build.format),
+    };
+    // Rewriting the watched file would change its modification time and rebuild
+    // forever, so this pair is a configuration mistake, not a loop to run.
+    if watch::same_file(&input, &output) {
+        let message = format!(
+            "output {} is the watched input; use -o/--out to name another file",
+            output.display()
+        );
+        return Outcome::usage(false, message).finish();
+    }
+
+    if once {
+        let started = Instant::now();
+        let outcome = build_document(&build, &input, false);
+        print_build_line(&outcome, started.elapsed());
+        return outcome.exit;
+    }
+
+    eprintln!("watching {} (Ctrl-C to stop)", input.display());
+    let mut watcher = watch::Watcher::new(Duration::from_millis(debounce_ms));
+    loop {
+        let now = Instant::now();
+        match watcher.step(now, watch::mtime(&input)) {
+            watch::Step::Unreachable(message) => {
+                println!("error {}: {message}", DiagCode::Io.as_str());
+            }
+            watch::Step::Build => {
+                let started = Instant::now();
+                let outcome = build_document(&build, &input, false);
+                print_build_line(&outcome, started.elapsed());
+            }
+            watch::Step::Wait => {}
+        }
+        std::thread::sleep(watch::TICK);
+    }
+}
+
+/// Report one watch build: warnings on stderr, one status line on stdout.
+///
+/// The status line is the build's verdict, so a failure is not repeated on
+/// stderr; a warning (`E_MATH_CONVERT`, `W_FRONTMATTER`, …) fails nothing and
+/// would otherwise be invisible.
+fn print_build_line(outcome: &Outcome, elapsed: Duration) {
+    for diagnostic in &outcome.report.diagnostics {
+        if diagnostic.severity != Severity::Error {
+            print_diagnostic(diagnostic);
+        }
+    }
+    println!("{}", build_line(outcome, elapsed));
+}
+
+/// The single status line `mdx watch` prints for one build.
+///
+/// The path is the one that was written, so `--once` and a rebuild report the
+/// same thing `mdx render` prints on stdout.
+fn build_line(outcome: &Outcome, elapsed: Duration) -> String {
+    if let (mdx_core::exit::OK, Some(path)) = (outcome.exit, outcome.output.as_deref()) {
+        return format!("built {path} in {} ms", elapsed.as_millis());
+    }
+    // `build_document` fails with a diagnostic; if one ever escapes without one,
+    // the exit code is still worth reporting.
+    let fallback_code = DiagCode::Io.as_str();
+    match outcome.report.errors().next() {
+        Some(diagnostic) => {
+            let code = diagnostic.code.as_str();
+            format!("error {code}: {}", diagnostic.message)
+        }
+        None => format!(
+            "error {fallback_code}: build failed (exit {})",
+            outcome.exit
+        ),
+    }
 }
 
 /// Default output path: the input path with the format's extension.
@@ -608,5 +818,62 @@ fn print_diagnostic(diagnostic: &Diagnostic) {
 fn print_json<T: Serialize>(value: &T) {
     if let Ok(text) = serde_json::to_string_pretty(value) {
         println!("{text}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The outline text of `source`, one line per heading.
+    fn outline_text(source: &str) -> String {
+        let (doc, _) = pipeline::parse_document(source, Path::new("test.md"));
+        doc.toc
+            .iter()
+            .map(outline_line)
+            .collect::<Vec<String>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn outline_lines_indent_by_heading_level() {
+        let text = outline_text("# One\n\n## Two\n\n### Three\n");
+        assert_eq!(text, "One (one)\n  Two (two)\n    Three (three)");
+    }
+
+    #[test]
+    fn outline_lines_keep_the_heading_id() {
+        // The id is the anchor a reader copies, so the dedupe suffix shows up
+        // in the outline instead of a second, identical-looking title.
+        let text = outline_text("## Notes\n\n## Notes\n");
+        assert_eq!(text, "  Notes (notes)\n  Notes (notes-1)");
+    }
+
+    #[test]
+    fn a_built_line_names_the_written_path_and_its_duration() {
+        let ok = Outcome::from_report(
+            Report::default(),
+            false,
+            Stdout::Path,
+            Some("/tmp/doc.pdf".to_string()),
+            None,
+            None,
+        );
+        let line = build_line(&ok, Duration::from_millis(12));
+        assert_eq!(line, "built /tmp/doc.pdf in 12 ms");
+    }
+
+    #[test]
+    fn a_failed_line_is_the_code_and_message_of_the_first_error() {
+        let mut report = Report::default();
+        report.push(Diagnostic::warning(DiagCode::FrontMatter, "no title"));
+        report.push(Diagnostic::error(
+            DiagCode::AssetMissing,
+            "image not found: pic.png",
+        ));
+        let failed = Outcome::from_report(report, false, Stdout::Silent, None, None, None);
+
+        let line = build_line(&failed, Duration::from_millis(3));
+        assert_eq!(line, "error E_ASSET_MISSING: image not found: pic.png");
     }
 }

@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# `benchmarks/` holds a standalone std-only crate used by hand
+# (`cargo run --manifest-path benchmarks/Cargo.toml`); it is excluded so the
+# root build, the tests and CI never compile it.
+exclude = ["benchmarks"]
 
 [workspace.package]
 version = "0.1.0"

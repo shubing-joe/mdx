@@ -23,14 +23,20 @@ const MIN_WINDOW_SIZE: [f32; 2] = [720.0, 480.0];
 
 fn main() -> eframe::Result {
     // Anything after the binary name is the file to open; a missing file is
-    // reported in the status bar, not by exiting.
+    // reported in the status bar, not by exiting. Files dropped on the window
+    // (see `app::MdxApp`) are the other way in.
     let initial = std::env::args_os().nth(1).map(PathBuf::from);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("mdx")
             .with_inner_size(WINDOW_SIZE)
-            .with_min_inner_size(MIN_WINDOW_SIZE),
+            .with_min_inner_size(MIN_WINDOW_SIZE)
+            // The OS drop target a drag of a `.md` file lands on. Back ends
+            // that let it be turned off default to accepting drops; asking for
+            // it keeps the shell's only way of opening a dragged file.
+            // API: https://docs.rs/egui/0.37.0/egui/viewport/struct.ViewportBuilder.html#method.with_drag_and_drop
+            .with_drag_and_drop(true),
         ..Default::default()
     };
 
