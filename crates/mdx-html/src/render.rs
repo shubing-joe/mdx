@@ -64,7 +64,9 @@ figure { margin-inline: 0; }
 .md-image, .diagram { text-align: center; }
 figcaption { margin-top: 0.45rem; color: #5a6068; font-size: 0.85rem; }
 .math { font-family: "STIX Two Math", "Latin Modern Math", "Cambria Math", "Times New Roman", serif; white-space: nowrap; }
+.math svg { vertical-align: -0.32em; max-width: 100%; height: auto; }
 .math-display { display: block; margin: 1.1rem 0; text-align: center; overflow-x: auto; }
+.math-display svg { display: block; margin: 0 auto; }
 .footnotes { margin-top: 3rem; padding-top: 0.75rem; border-top: 1px solid #e3e6ea; font-size: 0.9rem; color: #454a50; }
 .footnotes ol { padding-left: 1.4rem; }
 .footnote-ref { font-size: 0.75em; vertical-align: super; line-height: 0; }
@@ -518,6 +520,10 @@ impl<'a> HtmlWriter<'a> {
     }
 
     fn math_span(&mut self, latex: &str, display: bool) {
+        // Inline the formula as a self-contained SVG (glyphs are outlines), so
+        // the HTML matches the PDF offline: no MathJax, no webfonts, no network.
+        // A formula the engine cannot parse falls back to its LaTeX source.
+        let rendered = mdx_math::latex_to_svg(latex).ok();
         self.raw("<span class=\"math");
         if display {
             self.raw(" math-display");
@@ -525,7 +531,13 @@ impl<'a> HtmlWriter<'a> {
         self.raw("\"");
         self.attr("data-tex", latex);
         self.raw(">");
-        self.esc(latex);
+        match rendered {
+            Some(svg) => {
+                let svg = sanitize_fragment(&svg);
+                self.raw(&svg);
+            }
+            None => self.esc(latex),
+        }
         self.raw("</span>");
     }
 
@@ -991,10 +1003,26 @@ mod tests {
             },
         ];
         let html = render_blocks(blocks, &HtmlOptions::default());
-        assert!(html.contains(
-            "<div class=\"math-display\"><span class=\"math\" data-tex=\"E = mc^2\">E = mc^2</span></div>"
-        ));
-        assert!(html.contains("<span class=\"math\" data-tex=\"a^2\">a^2</span>"));
+        assert!(
+            html.contains(
+                "<div class=\"math-display\"><span class=\"math\" data-tex=\"E = mc^2\"><svg"
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains("<span class=\"math\" data-tex=\"a^2\"><svg"),
+            "{html}"
+        );
+
+        // A formula the engine rejects falls back to its verbatim source.
+        let fallback = render_blocks(
+            vec![Block::Math {
+                latex: "\\notacommand{1}".to_string(),
+                display: false,
+            }],
+            &HtmlOptions::default(),
+        );
+        assert!(fallback.contains(">\\notacommand{1}</span>"), "{fallback}");
     }
 
     #[test]

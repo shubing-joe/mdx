@@ -10,11 +10,15 @@ here.
 
 ## [Unreleased] — M2
 
-M2 is in flight: watch mode, `mdx outline`, three additional MCP tools,
-print-quality PDF structure, GUI usability work, performance baselines and
-packaging. None of it is released yet; the planned surface and its acceptance
-criteria are in [`docs/ROADMAP.md`](./docs/ROADMAP.md). Entries move into a
-version here as they ship.
+Shipped on `master`: `mdx watch` and `mdx outline`; three additional MCP tools
+(`md_outline`, `md_render_many`, `md_version`, eight in total); print-quality PDF
+emission (sticky headings, unbreakable tables/images, footnote rule); PDF/A-2b and
+PDF/UA-1 with a deterministic creation date and a title fallback; HTML math
+rendered as inline SVG with embedded glyph outlines (no MathJax, no webfonts);
+GUI drag-and-drop, recent files, outline navigation, diagnostic→caret jumps and
+clipboard-image paste; diagram disk cache; a 95-formula corpus; benchmarks and
+Arch packaging. See [`docs/ROADMAP.md`](./docs/ROADMAP.md) for acceptance
+criteria and remaining M3 candidates.
 
 ## [0.1.0] — 2026-10-23
 

@@ -154,7 +154,7 @@ fn render(body: &str) -> Result<String, String> {
         font_size: FONT_SIZE,
         padding: PADDING,
         stroke_width: STROKE_WIDTH,
-        embed_glyphs: false,
+        embed_glyphs: true,
         font_dir: String::new(),
     };
     Ok(render_to_svg(&display_list, &svg_options))

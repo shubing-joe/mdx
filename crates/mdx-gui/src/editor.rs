@@ -44,6 +44,8 @@ pub struct EditorState {
 
     /// Line a reveal asked for, applied by the next [`EditorState::show`].
     pending_reveal: Option<usize>,
+    /// Text queued for insertion at the caret (image paste), applied next frame.
+    pending_insert: Option<String>,
     /// Line the last reveal landed on, banded until the buffer changes under it.
     revealed_line: Option<usize>,
     /// Id of the pane's `TextEdit`, learned from the first frame it was drawn:
@@ -68,6 +70,7 @@ impl Default for EditorState {
             show_line_numbers: true,
             highlight_current_line: true,
             pending_reveal: None,
+            pending_insert: None,
             revealed_line: None,
             text_id: None,
             caret_line: 1,
@@ -106,10 +109,50 @@ impl EditorState {
         self.revealed_line
     }
 
+    /// Insert `snippet` at the caret on the next frame, replacing any selection.
+    ///
+    /// Used by the image-paste path: the caller has already written the file and
+    /// only needs the Markdown reference to land where the caret is.
+    pub fn insert_at_caret(&mut self, snippet: String) {
+        self.pending_insert = Some(snippet);
+    }
+
+    /// Replace the caret's selection (or insert at the caret) with `snippet`.
+    ///
+    /// Returns `false` and keeps the request queued when the pane has not been
+    /// drawn yet and therefore has no widget id to move the caret through.
+    fn insert_now(&mut self, ui: &Ui, text: &mut String, snippet: &str) -> bool {
+        let Some(editor_id) = self.text_id else {
+            self.pending_insert = Some(snippet.to_owned());
+            return false;
+        };
+        let mut state = TextEditState::load(ui.ctx(), editor_id).unwrap_or_default();
+        let range = state
+            .cursor
+            .char_range()
+            .unwrap_or_else(|| CCursorRange::one(CCursor::new(text.chars().count())));
+        let [start, end] = range.sorted_cursors();
+        let start_byte = byte_index(text, start.index.0);
+        let end_byte = byte_index(text, end.index.0);
+        text.replace_range(start_byte..end_byte, snippet);
+        let caret = CCursor::new(start.index.0 + snippet.chars().count());
+        state.cursor.set_char_range(Some(CCursorRange::one(caret)));
+        state.store(ui.ctx(), editor_id);
+        ui.memory_mut(|memory| memory.request_focus(editor_id));
+        self.revealed_line = None;
+        true
+    }
+
     /// Draw the source pane for `text`.
     ///
     /// Returns `true` when the user changed the buffer during this frame.
     pub fn show(&mut self, ui: &mut Ui, text: &mut String) -> bool {
+        // A paste of an image becomes a Markdown reference at the caret; apply
+        // it before the buffer is measured so this frame lays out the result.
+        let inserted = match self.pending_insert.take() {
+            Some(snippet) => self.insert_now(ui, text, &snippet),
+            None => false,
+        };
         let font_id = FontId::monospace(FONT_SIZE);
         // Same metric the widget uses for its rows, so the gutter lines up.
         // API: https://docs.rs/egui/0.37.0/egui/struct.Ui.html#method.fonts_mut
@@ -303,7 +346,7 @@ impl EditorState {
             self.caret_column = column;
         }
 
-        changed
+        changed || inserted
     }
 }
 
@@ -465,6 +508,14 @@ fn caret_position(galley: &Galley, cursor: CCursor) -> (usize, usize) {
     (line, layout.column.0 + 1)
 }
 
+/// Byte offset of `char_index` in `text`, clamped to the end of the buffer.
+fn byte_index(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len())
+}
+
 /// Number of lines in `text`, counting the empty line a trailing newline opens.
 fn count_lines(text: &str) -> usize {
     text.split('\n').count().max(1)
@@ -479,4 +530,32 @@ fn decimal_digits(value: usize) -> usize {
         digits += 1;
     }
     digits
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_index_clamps_and_counts_chars() {
+        assert_eq!(byte_index("abc", 0), 0);
+        assert_eq!(byte_index("abc", 2), 2);
+        assert_eq!(byte_index("你a", 1), 3);
+        assert_eq!(byte_index("abc", 99), 3);
+    }
+
+    #[test]
+    fn insert_at_caret_lands_in_the_buffer() {
+        let mut state = EditorState::default();
+        let mut text = String::from("hello");
+        egui::__run_test_ui(|ui| {
+            state.show(ui, &mut text);
+        });
+        state.insert_at_caret("![](assets/x.png)".to_owned());
+        egui::__run_test_ui(|ui| {
+            state.show(ui, &mut text);
+        });
+        assert!(text.ends_with("![](assets/x.png)"), "{text}");
+        assert!(text.starts_with("hello"), "{text}");
+    }
 }

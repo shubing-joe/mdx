@@ -234,6 +234,10 @@ The shell is an editor pane beside a live preview of the rendered pages.
   number, its size in points and its scale.
 - **Status bar:** caret position as `L:C`, page count, word and character counts,
   and how long the last build took.
+- **Pasted images:** copy a screenshot and press `Ctrl+V` in the editor; the PNG is
+  written to `assets/pasted-<hash>.png` beside the document and a Markdown image
+  reference is inserted at the caret. The bytes are embedded on export, so the
+  PDF/HTML stays a single file.
 
 `mdx-gui` links against a GL/EGL stack and a window system (`libglvnd`, `libx11`,
 `libxkbcommon`, `libwayland`).

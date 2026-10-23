@@ -25,7 +25,9 @@
 //! [`EditorState::reveal_line`] is what turns one into a caret and a scroll.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
 
@@ -531,9 +533,45 @@ impl MdxApp {
         }
     }
 
+    /// Paste a clipboard image as a Markdown reference at the caret.
+    ///
+    /// `TextEdit` only handles text, so a screenshot on the clipboard would
+    /// otherwise be dropped. The PNG is read through `wl-paste`, stored beside
+    /// the document under `assets/`, and the editor inserts the link at the
+    /// caret.
+    fn handle_image_paste(&mut self, ctx: &Context) {
+        let pressed = ctx.input(|input| {
+            input.key_pressed(Key::V) && input.modifiers.command && !input.modifiers.shift
+        });
+        if !pressed {
+            return;
+        }
+        let Some(png) = clipboard_image_png() else {
+            return;
+        };
+        let Some(path) = self.path.as_deref() else {
+            self.status = Status::error("Save the document before pasting an image");
+            return;
+        };
+        let directory = document_directory(Some(path)).join("assets");
+        if let Err(error) = fs::create_dir_all(&directory) {
+            self.status = Status::error(format!("Cannot create {}: {error}", directory.display()));
+            return;
+        }
+        let name = format!("pasted-{}.png", fnv_hex(&png));
+        let file = directory.join(&name);
+        if let Err(error) = fs::write(&file, &png) {
+            self.status = Status::error(format!("Cannot write {}: {error}", file.display()));
+            return;
+        }
+        self.editor.insert_at_caret(format!("![](assets/{name})"));
+        self.dirty = true;
+        self.status = Status::info(format!("Saved pasted image to assets/{name}"));
+        ctx.request_repaint();
+    }
+
     /// Follow a click in the diagnostics pane: put the caret on that
     /// diagnostic's line and highlight it.
-    ///
     /// Runs once the frame's panes have been drawn, so the index the pane read
     /// back is resolved against the diagnostics of the last run — the same
     /// slice the user saw.
@@ -1211,6 +1249,7 @@ impl eframe::App for MdxApp {
 
         self.handle_shortcuts(&ctx);
         self.handle_dropped_files(&ctx);
+        self.handle_image_paste(&ctx);
         self.pump(ctx.input(|input| input.time));
         self.schedule(&ctx);
 
@@ -1389,6 +1428,37 @@ fn document_directory(path: Option<&Path>) -> PathBuf {
 /// Default PDF path for a Markdown file: the same name with a `.pdf` suffix.
 fn default_pdf_path(path: &Path) -> PathBuf {
     path.with_extension("pdf")
+}
+
+/// The clipboard's PNG payload, when the clipboard holds an image.
+///
+/// `wl-paste` is the Wayland clipboard tool Omarchy ships. When it is missing,
+/// or the clipboard carries no image, this returns `None` and the paste falls
+/// through to the text path.
+fn clipboard_image_png() -> Option<Vec<u8>> {
+    let types = Command::new("wl-paste").arg("--list-types").output().ok()?;
+    let listing = String::from_utf8_lossy(&types.stdout);
+    if !listing
+        .lines()
+        .any(|line| line.trim().starts_with("image/"))
+    {
+        return None;
+    }
+    let out = Command::new("wl-paste")
+        .args(["--type", "image/png"])
+        .output()
+        .ok()?;
+    (out.status.success() && !out.stdout.is_empty()).then_some(out.stdout)
+}
+
+/// 16 lowercase hex digits of the FNV-1a hash: one stable name per image.
+fn fnv_hex(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 /// Every LaTeX formula in `doc`, converted for the Typst writer.
@@ -1883,5 +1953,18 @@ fn is_atx_heading(line: &str) -> bool {
         // A bare `#` is a heading as well.
         None => true,
         Some(character) => character == ' ' || character == '\t',
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::fnv_hex;
+
+    #[test]
+    fn image_names_are_stable_per_content() {
+        assert_eq!(fnv_hex(b""), "cbf29ce484222325");
+        assert_eq!(fnv_hex(b"same"), fnv_hex(b"same"));
+        assert_ne!(fnv_hex(b"a"), fnv_hex(b"b"));
+        assert_eq!(fnv_hex(b"a").len(), 16);
     }
 }
